@@ -1,0 +1,16 @@
+# secrets / local state — never commit
+*.env
+recap.env
+secrets/
+.recap/
+state/
+*.log
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# os
+.DS_Store

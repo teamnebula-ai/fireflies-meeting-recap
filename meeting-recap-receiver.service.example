@@ -1,0 +1,18 @@
+# systemd user unit. Copy to ~/.config/systemd/user/meeting-recap-receiver.service,
+# edit the paths, then:
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now meeting-recap-receiver.service
+[Unit]
+Description=Fireflies meeting-recap webhook receiver
+After=network-online.target
+
+[Service]
+# Adjust to wherever you cloned the repo and put the env file.
+WorkingDirectory=%h/fireflies-meeting-recap
+Environment=RECAP_ENV_FILE=%h/secrets/recap.env
+ExecStart=/usr/bin/python3 %h/fireflies-meeting-recap/receiver.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
