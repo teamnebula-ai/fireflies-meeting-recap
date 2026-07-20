@@ -10,9 +10,12 @@ everything except the writing:
   4. classify      ← recipients/send-mode purely by email domain (RECAP_INTERNAL_DOMAIN)
   5. generate      ← one-shot LLM CLI; stdout = recap HTML body ONLY
   6. send/draft    ← Composio Gmail v3 REST (GMAIL_SEND_EMAIL / *_CREATE_EMAIL_DRAFT)
-  7. status        ← optional notify (Telegram via the gen CLI, if configured)
+  7. reconcile     ← validated Linear completion/create actions
+  8. status        ← optional notify (Telegram via the gen CLI, if configured)
 
-The LLM never decides recipients, never sends, never dedupes — it only writes.
+The LLM never decides recipients, never sends, and never directly mutates
+Linear. It writes recap prose and proposes structured work; Python validates all
+candidate IDs, transcript evidence, workspace relationships, and writes.
 
 Recipient policy:
   - Internal meeting (all attendees @RECAP_INTERNAL_DOMAIN) → one recap to all attendees.
@@ -38,6 +41,9 @@ import urllib.request
 import urllib.error
 from datetime import datetime
 from pathlib import Path
+
+import linear_recap
+from linear_api import LinearAPI
 
 HERE = Path(__file__).resolve().parent
 HOME = Path(os.path.expanduser("~"))
@@ -70,15 +76,26 @@ def log(msg):
 
 def load_env():
     """Source RECAP_ENV_FILE into os.environ (KEY=VALUE, ignore #/blank)."""
+    global GEN_BIN, GEN_MODEL, GEN_TIMEOUT, INTERNAL_DOMAIN, OWNER_EMAIL
+    global NOTIFY_TARGET, WRITING_SPEC
     if not ENV_FILE.exists():
         log(f"note: env file {ENV_FILE} not present (relying on process env)")
-        return
-    for line in ENV_FILE.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, v = line.split("=", 1)
-        os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+    else:
+        for line in ENV_FILE.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+    # Module defaults are initialized before the env file is read. Refresh the
+    # configurable values so recap.env works as documented.
+    GEN_BIN = os.environ.get("RECAP_GEN_BIN", GEN_BIN)
+    GEN_MODEL = os.environ.get("RECAP_GEN_MODEL", GEN_MODEL)
+    GEN_TIMEOUT = int(os.environ.get("RECAP_GEN_TIMEOUT", str(GEN_TIMEOUT)))
+    INTERNAL_DOMAIN = os.environ.get("RECAP_INTERNAL_DOMAIN", INTERNAL_DOMAIN)
+    OWNER_EMAIL = os.environ.get("RECAP_OWNER_EMAIL", OWNER_EMAIL)
+    NOTIFY_TARGET = os.environ.get("RECAP_NOTIFY_TARGET", NOTIFY_TARGET)
+    WRITING_SPEC = Path(os.environ.get("RECAP_WRITING_SPEC", str(WRITING_SPEC)))
 
 
 # ----- idempotency ------------------------------------------------------------
@@ -276,6 +293,50 @@ def _clean_html(text):
     return out
 
 
+def _clean_json(text):
+    out = (text or "").strip()
+    if out.startswith("```"):
+        lines = out.splitlines()[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        out = "\n".join(lines).strip()
+    start = out.find("{")
+    end = out.rfind("}")
+    if start == -1 or end <= start:
+        raise ValueError("model returned no JSON object")
+    payload = json.loads(out[start:end + 1])
+    if not isinstance(payload, dict):
+        raise ValueError("model JSON is not an object")
+    return payload
+
+
+def generate_json(prompt):
+    """Run the configured model for structured analysis."""
+    if not (os.path.exists(GEN_BIN) or _which(GEN_BIN)):
+        raise RuntimeError(f"generation CLI '{GEN_BIN}' not found")
+    sub_env = dict(os.environ)
+    sub_env["HYPERSWARM_MEMORY_DISABLE"] = "1"
+    last = ""
+    for attempt in (1, 2):
+        log(f"gen structured attempt {attempt} model={GEN_MODEL}")
+        try:
+            proc = subprocess.run([GEN_BIN, "-m", GEN_MODEL, "-z", prompt],
+                                  capture_output=True, text=True,
+                                  timeout=GEN_TIMEOUT, env=sub_env)
+        except subprocess.TimeoutExpired:
+            last = f"timeout {GEN_TIMEOUT}s"
+            continue
+        if proc.returncode == 0:
+            try:
+                return _clean_json(proc.stdout)
+            except (ValueError, json.JSONDecodeError) as exc:
+                last = str(exc)
+        else:
+            last = f"rc={proc.returncode} stderr={proc.stderr[-300:]}"
+        log(f"structured attempt {attempt} unusable: {last}")
+    raise RuntimeError(f"structured generation failed: {last}")
+
+
 def generate_html(fmt, transcript):
     if not (os.path.exists(GEN_BIN) or _which(GEN_BIN)):
         sys.exit(f"ERROR: generation CLI '{GEN_BIN}' not found (set RECAP_GEN_BIN)")
@@ -380,6 +441,32 @@ def notify(msg):
         log(f"notify failed: {e}")
 
 
+def linear_enabled():
+    return os.environ.get("RECAP_LINEAR_ENABLED", "1").strip().lower() not in {
+        "0", "false", "no", "off",
+    }
+
+
+def reconcile_linear(transcript, dry=False):
+    """Best-effort Linear reconciliation; never fail the recap workflow."""
+    if not linear_enabled():
+        return {"completed": [], "created": [], "errors": [], "skipped": ["disabled"]}
+    try:
+        result = linear_recap.reconcile(transcript, LinearAPI(), generate_json, dry=dry)
+        log(linear_recap.summarize(result))
+        return result
+    except Exception as exc:
+        log(f"Linear reconciliation failed: {type(exc).__name__}: {exc}")
+        return {"completed": [], "created": [],
+                "errors": [f"{type(exc).__name__}: {exc}"], "skipped": []}
+
+
+def print_linear_dry_run(result):
+    print(f"--- {linear_recap.summarize(result)}")
+    if result.get("preview"):
+        print(json.dumps(result["preview"], indent=2, sort_keys=True))
+
+
 # ----- subjects ---------------------------------------------------------------
 def fmt_date(transcript):
     ds = transcript.get("dateString") or ""
@@ -454,14 +541,20 @@ def main():
             print(f"--- MODE={mode} FMT={fmt} RECIPIENTS=[draft->{OWNER_EMAIL or 'OWNER'}] REASON={reason}")
             print(f"--- SUBJECT: {subject}")
             print(html)
+            if usable:
+                print_linear_dry_run(reconcile_linear(transcript, dry=True))
             return
         if not OWNER_EMAIL:
             log("ambiguous and no RECAP_OWNER_EMAIL set — nothing to draft to")
+            if usable:
+                notify(linear_recap.summarize(reconcile_linear(transcript)))
             return
         r = create_draft(OWNER_EMAIL, subject, html)
         ok = not (isinstance(r, dict) and r.get("_error"))
-        notify(f"DRAFT held — \"{title}\". Reason: {reason}. Review your Gmail drafts."
-               if ok else f"Recap FAILED to draft — \"{title}\". {r}")
+        linear_result = reconcile_linear(transcript) if usable else None
+        linear_status = ("\n" + linear_recap.summarize(linear_result)) if linear_result else ""
+        notify((f"DRAFT held — \"{title}\". Reason: {reason}. Review your Gmail drafts."
+                if ok else f"Recap FAILED to draft — \"{title}\". {r}") + linear_status)
         if ok:
             ledger_add(mid)
         return
@@ -508,6 +601,7 @@ def main():
                   f"RECIPIENTS={s['recipients']}")
             print(f"    SUBJECT: {s['subject']}")
             print(s["html"])
+        print_linear_dry_run(reconcile_linear(transcript, dry=True))
         return
 
     # ----- send each descriptor; fail-safe to an owner draft on any error ------
@@ -519,12 +613,16 @@ def main():
         if not ok and OWNER_EMAIL:
             create_draft(OWNER_EMAIL, s["subject"], s["html"])
 
+    # Ticket reconciliation happens after email delivery and is best effort. A
+    # Linear outage or model failure can never suppress a recap email.
+    linear_result = reconcile_linear(transcript)
     ledger_add(mid)  # claim already prevents re-fire; never re-run (would double-send the parts that worked)
     lines = []
     for s, ok, r in results:
         label = _KIND_LABEL[s["kind"]]
         lines.append(f"✓ {label} → {', '.join(s['recipients'])}" if ok
                      else f"✗ {label} FAILED (held a draft): {r}")
+    lines.append(linear_recap.summarize(linear_result))
     notify(f"Recap for \"{title}\" ({mode}):\n" + "\n".join(lines))
 
 
