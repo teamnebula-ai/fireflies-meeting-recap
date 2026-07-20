@@ -23,6 +23,14 @@ SPAWN_LOG = Path(os.environ.get("RECAP_SPAWN_LOG", os.path.expanduser("~/.recap/
 PORT = int(os.environ.get("RECAP_RECEIVER_PORT", "8765"))
 
 
+def should_process_event(event):
+    """Only transcript-ready Fireflies events may take the meeting claim."""
+    normalized = str(event or "").strip().lower().replace("_", ".")
+    return any(marker in normalized for marker in (
+        "transcription completed", "transcribed", "summarized",
+    ))
+
+
 def log(msg):
     sys.stderr.write(f"[recap-receiver] {msg}\n")
     sys.stderr.flush()
@@ -59,6 +67,10 @@ class Handler(BaseHTTPRequestHandler):
         if not mid:
             log(f"no meetingId in payload: {str(payload)[:200]}")
             return self._json(202, {"status": "accepted", "note": "no meetingId; ignored"})
+        if not should_process_event(event):
+            log(f"ignored non-transcript event meeting-id={mid} event={event}")
+            return self._json(202, {"status": "accepted", "meetingId": mid,
+                                    "note": "event is not transcript-ready; ignored"})
 
         SPAWN_LOG.parent.mkdir(parents=True, exist_ok=True)
         fh = open(SPAWN_LOG, "a")
