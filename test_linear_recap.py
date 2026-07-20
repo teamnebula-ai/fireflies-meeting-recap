@@ -123,6 +123,12 @@ class TestCreationValidation(unittest.TestCase):
             "I will send the final scheduler launch plan by Friday.", date(2026, 7, 20))
         self.assertEqual(plan["create"][0]["due_date"], "2026-07-22")
 
+    def test_unknown_priority_falls_back_to_normal_due_date(self):
+        self.assertEqual(
+            linear_recap.sensible_due_date("", 99, date(2026, 7, 20)),
+            "2026-08-03",
+        )
+
     def test_cross_team_project_is_rejected(self):
         inputs = self._inputs()
         plan = linear_recap.validate_plan(

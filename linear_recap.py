@@ -305,7 +305,7 @@ def sensible_due_date(raw, priority, meeting_date):
         parsed = None
     if parsed and meeting_date <= parsed <= meeting_date + timedelta(days=366):
         return parsed.isoformat()
-    days = {1: 2, 2: 7, 3: 14, 4: 30}[priority]
+    days = {1: 2, 2: 7, 3: 14, 4: 30}.get(priority, 14)
     return (meeting_date + timedelta(days=days)).isoformat()
 
 
