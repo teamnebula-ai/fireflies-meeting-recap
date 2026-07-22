@@ -156,6 +156,96 @@ class TestCreationValidation(unittest.TestCase):
         self.assertIn("TMN-123", plan["skipped"][0])
 
 
+class TestTeamRecallDedup(unittest.TestCase):
+    """Duplicates phrased differently must still reach the adjudicator."""
+
+    TRANSCRIPT = {
+        "title": "Weekly sync",
+        "dateString": "2026-07-20T10:00:00Z",
+        "summary": {},
+        "sentences": [
+            {"text": "I will send the proposal document to Acme by Friday."},
+        ],
+        "meeting_attendees": [],
+    }
+
+    EXTRACTION = {
+        "completion_claims": [],
+        "future_tasks": [{
+            "title": "Send the proposal document to Acme",
+            "description": "Deliver the proposal.",
+            "team_name": "Team Nebula",
+            "project_name": "",
+            "assignee_email": "shawn@teamnebula.ai",
+            "due_date": "2026-07-24",
+            "priority": "high",
+            "evidence": "I will send the proposal document to Acme by Friday.",
+        }],
+    }
+
+    @staticmethod
+    def _team_issue(state_type="started"):
+        return {
+            "id": ISSUE_ID, "identifier": "TMN-123",
+            "title": "Draft and deliver Acme SOW",
+            "team": {"id": TEAM_ID, "name": "Team Nebula"},
+            "project": None,
+            "state": {"id": "state", "name": "In Progress", "type": state_type},
+        }
+
+    def _call(self, team_issues):
+        source = catalog()
+
+        def call(tool, args):
+            if tool == linear_recap.LIST_TEAMS:
+                return {"data": {"teams": source["teams"], "page_info": {}}}
+            if tool == linear_recap.LIST_PROJECTS:
+                return {"data": {"projects": source["projects"], "page_info": {}}}
+            if tool == linear_recap.LIST_USERS:
+                return {"data": {"users": source["users"], "page_info": {}}}
+            if tool == linear_recap.SEARCH_ISSUES:
+                return {"data": {"issues": [], "page_info": {}}}
+            if tool == linear_recap.LIST_TEAM_ISSUES:
+                return {"data": {"issues": list(team_issues), "page_info": {}}}
+            raise AssertionError(f"unexpected tool {tool}")
+        return call
+
+    def _model(self, adjudication):
+        prompts = []
+        responses = [self.EXTRACTION, adjudication]
+
+        def model(prompt):
+            prompts.append(prompt)
+            return responses[len(prompts) - 1]
+        return model, prompts
+
+    def test_open_team_issues_reach_the_adjudicator_when_search_misses(self):
+        model, prompts = self._model({"complete": [], "create": [{
+            "task_index": 0, "duplicate_candidate_id": "", "reason": "No match",
+        }]})
+        linear_recap.build_plan(self.TRANSCRIPT, self._call([self._team_issue()]), model)
+        self.assertEqual(len(prompts), 2)
+        self.assertIn("TMN-123", prompts[1])
+
+    def test_duplicate_verdict_on_team_recalled_candidate_suppresses_creation(self):
+        model, _ = self._model({"complete": [], "create": [{
+            "task_index": 0, "duplicate_candidate_id": ISSUE_ID,
+            "reason": "Same deliverable, different wording",
+        }]})
+        plan = linear_recap.build_plan(
+            self.TRANSCRIPT, self._call([self._team_issue()]), model)
+        self.assertEqual(plan["create"], [])
+        self.assertTrue(any(ISSUE_ID in entry for entry in plan["skipped"]))
+
+    def test_terminal_team_issues_are_not_offered_as_candidates(self):
+        model, prompts = self._model({"complete": [], "create": [{
+            "task_index": 0, "duplicate_candidate_id": "", "reason": "No match",
+        }]})
+        linear_recap.build_plan(
+            self.TRANSCRIPT, self._call([self._team_issue(state_type="completed")]), model)
+        self.assertNotIn("TMN-123", prompts[1])
+
+
 class TestApplyPlan(unittest.TestCase):
     def test_dry_run_never_calls_linear(self):
         calls = []

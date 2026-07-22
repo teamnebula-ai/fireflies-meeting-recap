@@ -19,8 +19,10 @@ GET_ISSUE = "LINEAR_GET_LINEAR_ISSUE"
 LIST_STATES = "LINEAR_LIST_LINEAR_STATES"
 UPDATE_ISSUE = "LINEAR_UPDATE_ISSUE"
 CREATE_ISSUE = "LINEAR_CREATE_LINEAR_ISSUE"
+LIST_TEAM_ISSUES = "LINEAR_LIST_TEAM_ISSUES"
 
 MAX_ACTIONS = 8
+TEAM_ISSUE_RECALL = 100
 _TERMINAL_TYPES = {"completed", "canceled", "cancelled"}
 _STOPWORDS = {
     "a", "an", "and", "for", "in", "of", "on", "the", "to", "with",
@@ -222,7 +224,7 @@ Schema:
 
 Rules:
 - Complete only an exact semantic match for explicitly completed work. Never select related, parent, umbrella, or merely similar work. Use only candidate IDs shown for that completion claim. Require high confidence.
-- For each future task, return one create decision. Set duplicate_candidate_id when an open candidate already represents substantially the same deliverable; otherwise leave it empty.
+- For each future task, return one create decision. Its candidates include the open issues of the task's team, not only text matches. Set duplicate_candidate_id when an open candidate already represents substantially the same deliverable, even when it is titled or worded differently — judge by outcome, not phrasing. Otherwise leave it empty.
 - Never invent an ID or task index.
 
 PROPOSALS:
@@ -241,6 +243,35 @@ def _search(call, query):
     }))
     issues = payload.get("issues") or payload.get("items") or []
     return [item for item in issues if isinstance(item, dict)]
+
+
+def _team_open_issues(call, team_id):
+    """Most recently updated open issues of one team, for duplicate recall."""
+    payload = _data(call(LIST_TEAM_ISSUES, {"team_id": team_id, "first": TEAM_ISSUE_RECALL}))
+    issues = payload.get("issues") or payload.get("items") or []
+    return [
+        item for item in issues
+        if isinstance(item, dict)
+        and str((item.get("state") or {}).get("type") or "").lower() not in _TERMINAL_TYPES
+    ]
+
+
+def _future_candidates(call, task, catalog, team_issue_cache):
+    """Search hits plus every open issue of the task's team.
+
+    Text search alone misses duplicates phrased differently; a paraphrased
+    ticket lives in the same team, so the whole open backlog of that team is
+    offered to the adjudicator.
+    """
+    candidates = _search(call, task.get("title")) if task.get("title") else []
+    team = _exact_name(catalog["teams"], task.get("team_name"))
+    team_id = (team or {}).get("id")
+    if team_id:
+        if team_id not in team_issue_cache:
+            team_issue_cache[team_id] = _team_open_issues(call, team_id)
+        seen = {c.get("id") for c in candidates}
+        candidates += [i for i in team_issue_cache[team_id] if i.get("id") not in seen]
+    return candidates
 
 
 def build_plan(transcript, call, model):
@@ -263,8 +294,9 @@ def build_plan(transcript, call, model):
         candidates = _search(call, query) if query else []
         groups.append({"kind": "completion", "intent_index": index, "intent": claim,
                        "candidates": candidates})
+    team_issue_cache = {}
     for index, task in enumerate(tasks):
-        candidates = _search(call, task.get("title")) if task.get("title") else []
+        candidates = _future_candidates(call, task, catalog, team_issue_cache)
         groups.append({"kind": "future", "intent_index": index, "intent": task,
                        "candidates": candidates})
 
