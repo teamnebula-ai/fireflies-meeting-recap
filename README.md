@@ -88,11 +88,34 @@ All configuration is environment variables (see
 | `COMPOSIO_API_KEY` / `COMPOSIO_USER_ID` | Gmail send/draft via Composio |
 | `LINEAR_API_KEY` / `NEB_LINEAR_API_KEY` | Linear GraphQL access; NEB-prefixed value wins |
 | `RECAP_INTERNAL_DOMAIN` | the domain that counts as "internal" |
+| `RECAP_BLOCKED_DOMAINS` | domains that must never receive an automated recap (comma-separated) |
+| `RECAP_EMAIL_ALIASES` | `alias=canonical` pairs for teammates on a second address |
 | `RECAP_OWNER_EMAIL` | fallback inbox for drafts / failures |
 | `RECAP_NOTIFY_TARGET` | optional status pings (blank to disable) |
 | `RECAP_GEN_BIN` / `RECAP_GEN_MODEL` | the generation CLI and model |
 | `RECAP_WRITING_SPEC` | path to the recap writing guidance |
 | `RECAP_LINEAR_ENABLED` | Linear reconciliation kill switch; defaults to enabled |
+
+### Recipient safety
+
+Three deterministic (non-LLM) gates run on every send:
+
+- **Blocked domains.** Addresses at a `RECAP_BLOCKED_DOMAINS` domain are
+  stripped from every route, and re-filtered again at the send boundary as a
+  belt-and-suspenders check. Classification still sees the true attendee list,
+  so a call with a blocked guest still produces the internal debrief for your
+  team — but no automated mail is ever addressed to a blocked inbox, and if the
+  only guest was blocked, no client recap is sent at all. Use this for clients
+  under a no-automation agreement.
+- **Email aliases.** `RECAP_EMAIL_ALIASES` canonicalizes teammates who join
+  under a second address (an agency account, a personal calendar) to their
+  internal identity, so those meetings classify as internal instead of leaking
+  an internal debrief route to an "external" address. Alias specific people,
+  never whole domains.
+- **Client content scan.** Client-facing HTML is checked against a prohibited
+  phrase list (internal debrief, deal health, competitive intel, transcript
+  links, ...) after generation; a real run aborts before anything is sent if the
+  scan matches, and `--dry` prints a warning.
 
 ## Linear reconciliation
 

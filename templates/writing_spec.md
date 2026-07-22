@@ -16,6 +16,8 @@ General standards for every recap:
    commitments ("I'll set that up") count.
 4. Group intelligently. A 30-min call has ~3-5 sections; a long call ~6-8.
 5. Always link the recording/transcript at the bottom of INTERNAL recaps.
+6. Never invent owners or due dates. If an owner or deadline was not stated,
+   write "Not stated".
 
 Priority tags: 🔴 Today · 🟡 This week · 🟢 Ongoing.
 
@@ -40,7 +42,7 @@ Use for standups, planning, retros, and other all-internal meetings.
 
 <!-- One numbered section per major topic -->
 <h2 style="color: #1a73e8;">1. [Topic Title]</h2>
-<p><strong>Decision:</strong> [State it clearly if one was made.]</p>
+<p><strong>Decision:</strong> [State it clearly if one was made; omit this line if no decision.]</p>
 <ul>
   <li><strong>[Sub-topic]:</strong> [Specifics — names, tools, numbers.]</li>
 </ul>
@@ -58,6 +60,7 @@ Use for standups, planning, retros, and other all-internal meetings.
 
 <hr style="border: none; border-top: 2px solid #1a73e8; margin: 24px 0;">
 <p>Full transcript and recording available on <a href="[transcript URL]">Fireflies</a>.</p>
+<p>[Short closing line reminding the team to check their action items and flag questions.]</p>
 <p>– [Sender name]</p>
 </body></html>
 ```
@@ -112,6 +115,7 @@ to whatever your team actually tracks.
 
 <hr style="border: none; border-top: 2px solid #1a73e8; margin: 24px 0;">
 <p>Full transcript and recording available on <a href="[transcript URL]">Fireflies</a>.</p>
+<p>[Short closing line for the team.]</p>
 <p>– [Sender name]</p>
 </body></html>
 ```
