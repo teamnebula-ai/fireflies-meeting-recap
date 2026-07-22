@@ -34,6 +34,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -65,6 +66,34 @@ INTERNAL_DOMAIN = os.environ.get("RECAP_INTERNAL_DOMAIN", "example.com")
 OWNER_EMAIL = os.environ.get("RECAP_OWNER_EMAIL", "")        # fallback/ambiguous draft target
 NOTIFY_TARGET = os.environ.get("RECAP_NOTIFY_TARGET", "")    # optional status pings (e.g. telegram:123)
 
+
+def _parse_domains(raw):
+    return {d.strip().lower().lstrip("@") for d in (raw or "").split(",") if d.strip()}
+
+
+def _parse_aliases(raw):
+    """'alias@a.com=canonical@b.com,...' -> {alias: canonical} (lowercased)."""
+    out = {}
+    for pair in (raw or "").split(","):
+        if "=" not in pair:
+            continue
+        alias, canonical = pair.split("=", 1)
+        alias, canonical = alias.strip().lower(), canonical.strip().lower()
+        if "@" in alias and "@" in canonical:
+            out[alias] = canonical
+    return out
+
+
+# Domains that must NEVER receive an automated recap (e.g. a client under a
+# no-automation agreement). Filtered by DOMAIN, not by meeting tag, so the
+# guarantee holds even when such a person joins a call about something else.
+BLOCKED_DOMAINS = _parse_domains(os.environ.get("RECAP_BLOCKED_DOMAINS", ""))
+
+# Teammates who join meetings under a second address (e.g. an agency account)
+# but are internal. Alias SPECIFIC people, not whole domains — aliasing a domain
+# would classify a genuine guest at that domain as internal.
+EMAIL_ALIASES = _parse_aliases(os.environ.get("RECAP_EMAIL_ALIASES", ""))
+
 FIREFLIES_GQL = "https://api.fireflies.ai/graphql"
 COMPOSIO_EXEC = "https://backend.composio.dev/api/v3/tools/execute"
 
@@ -77,7 +106,7 @@ def log(msg):
 def load_env():
     """Source RECAP_ENV_FILE into os.environ (KEY=VALUE, ignore #/blank)."""
     global GEN_BIN, GEN_MODEL, GEN_TIMEOUT, INTERNAL_DOMAIN, OWNER_EMAIL
-    global NOTIFY_TARGET, WRITING_SPEC
+    global NOTIFY_TARGET, WRITING_SPEC, BLOCKED_DOMAINS, EMAIL_ALIASES
     if not ENV_FILE.exists():
         log(f"note: env file {ENV_FILE} not present (relying on process env)")
     else:
@@ -96,6 +125,8 @@ def load_env():
     OWNER_EMAIL = os.environ.get("RECAP_OWNER_EMAIL", OWNER_EMAIL)
     NOTIFY_TARGET = os.environ.get("RECAP_NOTIFY_TARGET", NOTIFY_TARGET)
     WRITING_SPEC = Path(os.environ.get("RECAP_WRITING_SPEC", str(WRITING_SPEC)))
+    BLOCKED_DOMAINS = _parse_domains(os.environ.get("RECAP_BLOCKED_DOMAINS", ""))
+    EMAIL_ALIASES = _parse_aliases(os.environ.get("RECAP_EMAIL_ALIASES", ""))
 
 
 # ----- idempotency ------------------------------------------------------------
@@ -180,10 +211,20 @@ def attendee_emails(transcript):
     atts = transcript.get("meeting_attendees") or []
     emails = []
     for a in atts:
-        e = (a.get("email") or "").strip().lower()
+        e = canonical_email((a.get("email") or "").strip().lower())
         if e and "@" in e and e not in emails:
             emails.append(e)
     return emails
+
+
+def canonical_email(email):
+    """Map an aliased teammate address to their canonical internal identity."""
+    return EMAIL_ALIASES.get(email, email)
+
+
+def is_blocked_recipient(email):
+    domain = (email.split("@", 1)[1] if "@" in email else "").lower()
+    return domain in BLOCKED_DOMAINS
 
 
 def classify(transcript):
@@ -216,15 +257,26 @@ def route_sends(mode, internal_recipients, all_emails):
     Safety invariant (enforced here, asserted by tests): a 'sales_debrief' send
     NEVER contains an external address. The only thing that reaches outside
     guests is the 'client' send, which carries the client-safe HTML.
+
+    Blocked domains (RECAP_BLOCKED_DOMAINS) are stripped from every route.
+    Classification upstream still sees the true attendee list — a call with a
+    blocked guest still counts as 'sales', so the team gets the candid debrief —
+    but no recap is ever ADDRESSED to a blocked inbox.
     """
+    sendable = lambda emails: [e for e in emails if not is_blocked_recipient(e)]
     if mode == "internal":
-        return [{"kind": "internal", "recipients": all_emails}]
+        recipients = sendable(all_emails)
+        return [{"kind": "internal", "recipients": recipients}] if recipients else []
     if mode == "sales":
         sends = []
-        if internal_recipients:
-            sends.append({"kind": "sales_debrief", "recipients": list(internal_recipients)})
-        if all_emails:
-            sends.append({"kind": "client", "recipients": list(all_emails)})
+        debrief = sendable(internal_recipients)
+        if debrief:
+            sends.append({"kind": "sales_debrief", "recipients": debrief})
+        client = sendable(all_emails)
+        # Only send a client recap if a genuine external recipient remains after
+        # filtering — a call whose only guest was blocked has no client to recap to.
+        if any(not e.endswith("@" + INTERNAL_DOMAIN) for e in client):
+            sends.append({"kind": "client", "recipients": client})
         return sends
     return []  # ambiguous -> handled as a draft to the owner, not an auto-send
 
@@ -279,6 +331,20 @@ Use exactly this HTML structure:
 <p>Best,<br>[Meeting host name]</p>
 </body></html>
 """
+
+
+# Deterministic content-safety scan for client-facing HTML: phrases that only
+# appear when internal framing leaked into a client email. Cheap, non-LLM, final
+# gate — the CLIENT_SPEC prompt is the first line of defense, this is the second.
+_CLIENT_PROHIBITED = re.compile(
+    r"\b(internal debrief|deal health|competitive intel|budget authority|"
+    r"fireflies transcript|recording link)\b", re.IGNORECASE)
+
+
+def client_safety_violation(html):
+    """Return the offending phrase if client HTML fails the safety scan, else None."""
+    m = _CLIENT_PROHIBITED.search(html or "")
+    return m.group(0) if m else None
 
 
 def _clean_html(text):
@@ -356,7 +422,8 @@ def generate_html(fmt, transcript):
             f"========================================================\n"
             f"Produce ONLY the email HTML body. Output raw HTML starting with "
             f"<html> and ending with </html>. No preamble, no commentary, no "
-            f"code fences, no To/From/Subject lines.\n\n"
+            f"code fences, no To/From/Subject lines. Never invent facts, owners, "
+            f"deadlines, or commitments.\n\n"
             f"TRANSCRIPT (JSON):\n{ctx}"
         )
     else:
@@ -372,7 +439,9 @@ def generate_html(fmt, transcript):
             f"Produce ONLY the email HTML body for this meeting using the "
             f"{fmt_label} template and the quality standards above. Output raw HTML "
             f"starting with <html> and ending with </html>. No preamble, no "
-            f"commentary, no code fences, no To/From/Subject lines.\n\n"
+            f"commentary, no code fences, no To/From/Subject lines. Never invent "
+            f"facts, owners, deadlines, or commitments — if an owner or deadline "
+            f"was not stated, write \"Not stated\".\n\n"
             f"TRANSCRIPT (JSON):\n{ctx}"
         )
     sub_env = dict(os.environ)
@@ -593,6 +662,14 @@ def main():
     for s in sends:
         s["subject"] = subj_for_kind[s["kind"]]
         s["html"] = generate_html(fmt_for_kind[s["kind"]], transcript)
+        if s["kind"] == "client":
+            bad = client_safety_violation(s["html"])
+            if bad and not args.dry:
+                sys.exit(f"ERROR: client recap failed deterministic content-safety "
+                         f"scan (matched {bad!r}) — nothing sent")
+            if bad:
+                print(f"--- WARNING: client recap failed content-safety scan "
+                      f"(matched {bad!r}) — a real run would abort")
 
     if args.dry:
         print(f"--- MODE={mode} FMT={fmt} REASON={reason}")
@@ -607,6 +684,12 @@ def main():
     # ----- send each descriptor; fail-safe to an owner draft on any error ------
     results = []
     for s in sends:
+        # Belt-and-suspenders: route_sends already strips blocked domains, but
+        # re-filter at the send boundary so no future routing change can ever
+        # address an automated recap to a blocked inbox.
+        s["recipients"] = [e for e in s["recipients"] if not is_blocked_recipient(e)]
+        if not s["recipients"]:
+            continue
         r = send_email(s["recipients"], s["subject"], s["html"])
         ok = not (isinstance(r, dict) and r.get("_error"))
         results.append((s, ok, r))

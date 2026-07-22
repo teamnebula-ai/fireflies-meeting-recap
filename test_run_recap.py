@@ -82,6 +82,103 @@ class TestRouting(unittest.TestCase):
         self.assertEqual(run_recap.route_sends("ambiguous", [], ["guest@acme.com"]), [])
 
 
+class TestBlockedDomains(unittest.TestCase):
+    """RECAP_BLOCKED_DOMAINS: no automated recap may be ADDRESSED to a blocked
+    inbox, while classification still sees the true attendee list."""
+
+    def setUp(self):
+        self._orig = run_recap.BLOCKED_DOMAINS
+        run_recap.BLOCKED_DOMAINS = {"lockeddown.com"}
+
+    def tearDown(self):
+        run_recap.BLOCKED_DOMAINS = self._orig
+
+    def test_classification_still_sees_blocked_guest(self):
+        # internal + blocked guest is still a sales call -> team gets the debrief
+        mode, fmt, recips, _ = run_recap.classify(
+            _t(["host@example.com", "guest@lockeddown.com"]))
+        self.assertEqual(mode, "sales")
+        self.assertEqual(recips, ["host@example.com"])
+
+    def test_blocked_stripped_from_every_route(self):
+        internal = ["host@example.com"]
+        allm = ["host@example.com", "guest@lockeddown.com", "lee@acme.com"]
+        sends = run_recap.route_sends("sales", internal, allm)
+        for s in sends:
+            self.assertNotIn("guest@lockeddown.com", s["recipients"],
+                             f"{s['kind']} addressed a blocked inbox")
+        # genuine external guest still gets the client recap
+        kinds = {s["kind"]: s["recipients"] for s in sends}
+        self.assertIn("lee@acme.com", kinds["client"])
+
+    def test_no_client_recap_when_only_guest_is_blocked(self):
+        internal = ["host@example.com"]
+        allm = ["host@example.com", "guest@lockeddown.com"]
+        sends = run_recap.route_sends("sales", internal, allm)
+        kinds = {s["kind"] for s in sends}
+        self.assertIn("sales_debrief", kinds)   # team still gets the debrief
+        self.assertNotIn("client", kinds)       # nobody left to client-recap
+
+    def test_internal_route_filters_blocked(self):
+        allm = ["a@example.com", "b@lockeddown.com"]
+        sends = run_recap.route_sends("internal", allm, allm)
+        self.assertEqual(sends[0]["recipients"], ["a@example.com"])
+
+    def test_all_blocked_routes_nothing(self):
+        allm = ["a@lockeddown.com"]
+        self.assertEqual(run_recap.route_sends("internal", allm, allm), [])
+
+    def test_is_blocked_recipient_case_insensitive(self):
+        self.assertTrue(run_recap.is_blocked_recipient("X@LockedDown.com".lower()))
+        self.assertFalse(run_recap.is_blocked_recipient("x@example.com"))
+
+
+class TestEmailAliases(unittest.TestCase):
+    """RECAP_EMAIL_ALIASES: teammates on a second address classify as internal."""
+
+    def setUp(self):
+        self._orig = run_recap.EMAIL_ALIASES
+        run_recap.EMAIL_ALIASES = {"jane@agency.co": "jane@example.com"}
+
+    def tearDown(self):
+        run_recap.EMAIL_ALIASES = self._orig
+
+    def test_aliased_teammate_classifies_internal(self):
+        mode, fmt, recips, _ = run_recap.classify(
+            _t(["host@example.com", "jane@agency.co"]))
+        self.assertEqual(mode, "internal")
+        self.assertEqual(set(recips), {"host@example.com", "jane@example.com"})
+
+    def test_alias_dedupes_against_canonical(self):
+        emails = run_recap.attendee_emails(
+            _t(["jane@example.com", "jane@agency.co"]))
+        self.assertEqual(emails, ["jane@example.com"])
+
+    def test_unaliased_domain_peer_stays_external(self):
+        # only jane is aliased; a colleague at the same agency domain is a guest
+        mode, fmt, recips, _ = run_recap.classify(
+            _t(["host@example.com", "sam@agency.co"]))
+        self.assertEqual(mode, "sales")
+        self.assertEqual(recips, ["host@example.com"])
+
+
+class TestClientSafetyScan(unittest.TestCase):
+    def test_clean_client_html_passes(self):
+        self.assertIsNone(run_recap.client_safety_violation(
+            "<html><body><p>Thanks for your time today.</p></body></html>"))
+
+    def test_prohibited_phrases_flagged(self):
+        for phrase in ("internal debrief", "Deal Health", "competitive intel",
+                       "budget authority", "Fireflies transcript", "recording link"):
+            html = f"<html><body><p>see the {phrase} for details</p></body></html>"
+            self.assertEqual(run_recap.client_safety_violation(html).lower(),
+                             phrase.lower(), phrase)
+
+    def test_empty_html_passes(self):
+        self.assertIsNone(run_recap.client_safety_violation(""))
+        self.assertIsNone(run_recap.client_safety_violation(None))
+
+
 class TestAtomicClaim(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
