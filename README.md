@@ -72,10 +72,92 @@ RECAP_ENV_FILE=~/secrets/recap.env python3 receiver.py
 #     systemctl --user enable --now meeting-recap-receiver.service
 ```
 
-Expose `127.0.0.1:8765` publicly with TLS using whatever you prefer — Tailscale
-Funnel, a Cloudflare tunnel, or an nginx reverse proxy — then register the
-public `…/webhooks/fireflies` URL in your Fireflies dashboard under
-**Integrations → Webhooks**.
+Then set up the webhook (next section).
+
+## Webhook setup
+
+Fireflies webhook registration is dashboard-only: there is no API mutation for
+it. Register the public URL once under **Integrations → Webhooks** at
+https://app.fireflies.ai/integrations/custom/webhooks and treat it as
+permanent. Every re-registration is a manual dashboard visit, so pick a URL
+that never rotates (a stable hostname, not an ephemeral tunnel), and prefer
+keeping it stable across infrastructure moves (see the relay setup below).
+
+### Single host
+
+The receiver binds `127.0.0.1:8765`. Expose it publicly with TLS using
+whatever you prefer; with Tailscale Funnel:
+
+```bash
+sudo tailscale funnel --bg --set-path=/webhooks/fireflies http://127.0.0.1:8765
+```
+
+Register `https://<host>.<tailnet>.ts.net/webhooks/fireflies` in the Fireflies
+dashboard. Funnel hostnames are permanent, so this survives restarts and
+re-deploys.
+
+### Split hosts: keep the registered URL, move the worker
+
+When the recap service moves to another machine, keep the original host as a
+dumb front door and relay to the new worker over the tailnet. Fireflies keeps
+posting to the same URL and the dashboard never needs touching.
+
+On the **worker** (runs receiver.py, loopback-bound), expose the port to the
+tailnet only. The worker gets no public endpoint:
+
+```bash
+sudo tailscale serve --bg --tcp=8765 tcp://127.0.0.1:8765
+```
+
+On the **front door** (owns the registered URL), run a socat relay as a
+systemd user unit:
+
+```ini
+# ~/.config/systemd/user/meeting-recap-relay.service
+[Unit]
+Description=Meeting Recap - relay Fireflies webhook to the worker (tailnet)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/socat TCP-LISTEN:8765,fork,reuseaddr,bind=127.0.0.1 TCP:<worker>.<tailnet>.ts.net:8765
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+```
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now meeting-recap-relay.service
+sudo tailscale funnel --bg --set-path=/webhooks/fireflies http://127.0.0.1:8765
+```
+
+The public TLS leg terminates at the front door's Funnel; the front-door to
+worker leg is plain HTTP inside the tailnet, encrypted in transit by
+WireGuard. Disable any old receiver unit on the front door
+(`systemctl --user disable --now meeting-recap-receiver.service`) so a reboot
+cannot resurrect a second sender.
+
+### Verify
+
+Post a non-transcript event at the registered URL and confirm the worker saw
+it:
+
+```bash
+curl -X POST -H 'Content-Type: application/json' \
+  -d '{"meetingId":"SMOKE-1","eventType":"meeting.bot_joined"}' \
+  https://<front-door>/webhooks/fireflies
+# expect HTTP 202 {"status": "accepted", ... "ignored"}
+
+journalctl --user -u meeting-recap-receiver.service -n 3   # on the worker
+# expect: ignored non-transcript event meeting-id=SMOKE-1
+```
+
+The smoke event is ignored by design, so it proves routing without generating
+or sending anything.
 
 ## Configuration
 
