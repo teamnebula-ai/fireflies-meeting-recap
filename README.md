@@ -3,7 +3,8 @@
 Turn a finished [Fireflies](https://fireflies.ai) meeting into a recap email,
 automatically. When Fireflies finishes transcribing, a webhook fires a small
 deterministic Python driver that fetches the transcript, decides recipients by
-email domain, writes the recap with an LLM, and sends it through Gmail.
+email domain, writes the recap with an LLM, sends it through Gmail, and
+reconciles explicit meeting work with Linear.
 
 The interesting part is the recipient policy. The driver — not the model —
 decides who gets what:
@@ -32,7 +33,8 @@ Fireflies "transcription completed"
                               4. classify  recipients/mode by email domain
                               5. generate  one-shot LLM CLI → recap HTML body only
                               6. send      Composio Gmail (send / draft)
-                              7. notify    optional status ping
+                              7. reconcile search/update/create Linear work
+                              8. notify    optional status ping
 ```
 
 ## Why the atomic claim matters
@@ -48,7 +50,8 @@ event wins and every duplicate bails immediately.
 ## Install
 
 Requires Python 3.8+ (standard library only), a Fireflies API key, and a
-[Composio](https://composio.dev) account with a connected Gmail.
+[Composio](https://composio.dev) account with connected Gmail, plus a Linear
+workspace API key.
 
 ```bash
 git clone https://github.com/Screddyice/fireflies-meeting-recap.git
@@ -83,11 +86,41 @@ All configuration is environment variables (see
 |---|---|
 | `FIREFLIES_API_KEY` | Fireflies GraphQL auth |
 | `COMPOSIO_API_KEY` / `COMPOSIO_USER_ID` | Gmail send/draft via Composio |
+| `LINEAR_API_KEY` / `NEB_LINEAR_API_KEY` | Linear GraphQL access; NEB-prefixed value wins |
 | `RECAP_INTERNAL_DOMAIN` | the domain that counts as "internal" |
 | `RECAP_OWNER_EMAIL` | fallback inbox for drafts / failures |
 | `RECAP_NOTIFY_TARGET` | optional status pings (blank to disable) |
 | `RECAP_GEN_BIN` / `RECAP_GEN_MODEL` | the generation CLI and model |
 | `RECAP_WRITING_SPEC` | path to the recap writing guidance |
+| `RECAP_LINEAR_ENABLED` | Linear reconciliation kill switch; defaults to enabled |
+
+## Linear reconciliation
+
+Every usable transcript gets a separate structured analysis after the recap is
+prepared. The system first loads the live Linear teams, projects, memberships,
+and users. It extracts only two kinds of work:
+
+- explicitly completed work that may match an existing issue;
+- explicit future commitments with an internal owner.
+
+It searches Linear before any write, then runs a second match adjudication. A
+completion is allowed only when the selected issue came from that claim's
+search results, the transcript contains the proposed evidence verbatim, the
+issue is still open, and its title strongly matches the completed work. The
+issue is fetched again immediately before moving it to that team's completed
+state.
+
+New issues are minimized by merging related commitments during extraction and
+searching each proposed title before creation. Open title matches are suppressed
+even if the model misses the duplicate. Team, project, assignee membership,
+priority, and due date are validated in Python; unclear owners or cross-team
+projects are skipped instead of creating loose tickets. Projects are the Linear
+"folder" used when the transcript clearly maps to one; otherwise the issue is
+placed in the resolved team without guessing a project.
+
+Linear failures are reported in the status notification but never block recap
+email delivery. `--dry` performs reads and prints the validated Linear plan but
+never calls an update or create tool.
 
 ### Bring your own LLM
 
@@ -104,8 +137,8 @@ kept separate on purpose so internal framing can't leak into a client email.
 python3 run_recap.py --meeting-id <FIREFLIES_MEETING_ID> --dry
 ```
 
-`--dry` fetches, classifies, and generates, then prints the full send plan
-(recipients + subject + HTML) and sends nothing.
+`--dry` fetches, classifies, and generates, then prints the full email and
+validated Linear plans. It sends no email and performs no Linear writes.
 
 ## Tests
 
@@ -114,7 +147,8 @@ python3 -m unittest -v
 ```
 
 Covers classification, recipient routing (including the no-external-leak
-invariant), and the atomic claim.
+invariant), atomic claims, completion evidence/candidate gates, duplicate
+suppression, team/project/user resolution, due dates, and dry-run write safety.
 
 ## Status
 
