@@ -126,6 +126,20 @@ class LinearAPI:
             })
             return self._connection(data["searchIssues"], "issues")
 
+        if tool == linear_recap.LIST_TEAM_ISSUES:
+            query = f"""query TeamIssues($teamId:ID!,$first:Int,$after:String,$excludedStateTypes:[String!]) {{
+              issues(first:$first,after:$after,orderBy:updatedAt,
+                     filter:{{team:{{id:{{eq:$teamId}}}},state:{{type:{{nin:$excludedStateTypes}}}}}}) {{
+                nodes {{ {_ISSUE_FIELDS} }} {_PAGE}
+              }}
+            }}"""
+            data = self._graphql(query, {
+                "teamId": args["team_id"], "first": args.get("first", 100),
+                "after": args.get("after"),
+                "excludedStateTypes": ["completed", "canceled"],
+            })
+            return self._connection(data["issues"], "issues")
+
         if tool == linear_recap.GET_ISSUE:
             query = f"""query Issue($id:String!) {{ issue(id:$id) {{ {_ISSUE_FIELDS} }} }}"""
             data = self._graphql(query, {"id": args["issue_id"]})

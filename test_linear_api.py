@@ -62,6 +62,18 @@ class TestLinearAPI(unittest.TestCase):
         })
         self.assertEqual(response["data"]["issue"]["identifier"], "TMN-1")
 
+    def test_team_issue_listing_requests_open_issues_for_the_team(self):
+        request = RecordingRequest([{"data": {"issues": {
+            "nodes": [{"id": "issue", "identifier": "TMN-9", "title": "Draft Acme SOW"}],
+            "pageInfo": {"hasNextPage": False, "endCursor": None},
+        }}}])
+        client = linear_api.LinearAPI(api_key="test", request=request)
+        response = client(linear_recap.LIST_TEAM_ISSUES, {"team_id": "team", "first": 100})
+        variables = request.calls[0][1]
+        self.assertEqual(variables["teamId"], "team")
+        self.assertEqual(variables["excludedStateTypes"], ["completed", "canceled"])
+        self.assertEqual(response["data"]["issues"][0]["identifier"], "TMN-9")
+
     def test_graphql_errors_are_returned_without_raising_to_caller(self):
         request = RecordingRequest([{"errors": [{"message": "denied"}]}])
         client = linear_api.LinearAPI(api_key="test", request=request)

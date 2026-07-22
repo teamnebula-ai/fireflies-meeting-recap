@@ -134,8 +134,13 @@ issue is fetched again immediately before moving it to that team's completed
 state.
 
 New issues are minimized by merging related commitments during extraction and
-searching each proposed title before creation. Open title matches are suppressed
-even if the model misses the duplicate. Team, project, assignee membership,
+searching each proposed title before creation. Because a duplicate is usually a
+paraphrase rather than a text match, the candidate pool for every proposed task
+also includes the open issues of its target team (the 100 most recently
+updated, terminal states excluded), so the adjudicator compares the proposal
+against the team's real backlog and suppresses tickets that describe the same
+deliverable in different words. Open title matches are suppressed even if the
+model misses the duplicate. Team, project, assignee membership,
 priority, and due date are validated in Python; unclear owners or cross-team
 projects are skipped instead of creating loose tickets. Projects are the Linear
 "folder" used when the transcript clearly maps to one; otherwise the issue is
