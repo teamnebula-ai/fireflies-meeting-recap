@@ -202,6 +202,18 @@ class TestAtomicClaim(unittest.TestCase):
         self.assertTrue(run_recap.claim("weird/id"))
         self.assertFalse(run_recap.claim("weird/id"))
 
+    def test_claim_and_ledger_state_are_owner_only(self):
+        mid = "01KW9T2YQJBMEB3S2WS3DZSKJC"
+        self.assertTrue(run_recap.claim(mid))
+        run_recap.ledger_add(mid)
+
+        claim_dir = run_recap.LEDGER.parent / "recap-claims"
+        claim_file = claim_dir / f"{mid}.lock"
+        self.assertEqual(claim_dir.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(claim_file.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(run_recap.LEDGER.parent.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(run_recap.LEDGER.stat().st_mode & 0o777, 0o600)
+
 
 if __name__ == "__main__":
     unittest.main()

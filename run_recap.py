@@ -141,8 +141,11 @@ def ledger_add(mid):
     seen = ledger_load()
     if mid not in seen:
         seen.append(mid)
-        LEDGER.parent.mkdir(parents=True, exist_ok=True)
-        LEDGER.write_text(json.dumps(seen))
+        LEDGER.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        LEDGER.parent.chmod(0o700)
+        fd = os.open(str(LEDGER), os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
+        with os.fdopen(fd, "w") as ledger:
+            ledger.write(json.dumps(seen))
 
 
 def claim(mid):
@@ -159,12 +162,13 @@ def claim(mid):
     bails. Returns True if WE claimed it, False if someone already had it.
     """
     d = LEDGER.parent / "recap-claims"
-    d.mkdir(parents=True, exist_ok=True)
+    d.mkdir(mode=0o700, parents=True, exist_ok=True)
+    d.chmod(0o700)
     p = d / (mid.replace("/", "_") + ".lock")
     try:
-        fd = os.open(str(p), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-        os.write(fd, str(time.time()).encode())
-        os.close(fd)
+        fd = os.open(str(p), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        with os.fdopen(fd, "w") as claim_file:
+            claim_file.write(str(time.time()))
         return True
     except FileExistsError:
         return False
