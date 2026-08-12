@@ -259,8 +259,15 @@ def owner_joined_meeting(transcript):
         return True
     for attendee in attendance:
         name = _norm_name((attendee or {}).get("name"))
-        if name and any(name == owner or owner in name for owner in owner_names):
-            return True
+        tokens = set(re.findall(r"\b[\w'-]+\b", name))
+        for owner in owner_names:
+            if not owner:
+                continue
+            if " " in owner:
+                if name == owner:
+                    return True
+            elif owner in tokens:
+                return True
     return False
 
 
@@ -451,15 +458,21 @@ def enforce_owner_signature(html):
     """Deterministically sign every recap from Shawn, never from another attendee."""
     out = _clean_html(html)
     signature = f"<p>Best,<br>{_html_escape(OWNER_DISPLAY_NAME)}</p>"
-    closing_re = re.compile(
-        r"(?is)<p[^>]*>\s*(best|regards|thanks|thank you|sincerely|cheers)\b.*?</p>\s*(?=</body>)"
-    )
-    out, replaced = closing_re.subn(signature, out, count=1)
-    if replaced:
-        return out
-    if re.search(r"(?is)</body>", out):
-        return re.sub(r"(?is)</body>", signature + "\n</body>", out, count=1)
-    return out + "\n" + signature
+    body_match = re.search(r"(?is)</body>", out)
+    if not body_match:
+        return out + "\n" + signature
+
+    before_body = out[:body_match.start()]
+    paragraphs = list(re.finditer(r"(?is)<p[^>]*>.*?</p>", before_body))
+    if not paragraphs:
+        return out[:body_match.start()] + signature + "\n" + out[body_match.start():]
+
+    last = paragraphs[-1]
+    last_text = re.sub(r"(?is)<br\s*/?>", "\n", last.group(0))
+    last_text = re.sub(r"(?is)<[^>]+>", "", last_text).strip().lower()
+    if re.match(r"^(best|regards|thanks|thank you|sincerely|cheers)\b", last_text):
+        return before_body[:last.start()] + signature + before_body[last.end():] + out[body_match.start():]
+    return before_body + signature + "\n" + out[body_match.start():]
 
 
 def generate_html(fmt, transcript):

@@ -77,6 +77,11 @@ class TestOwnerAttendance(unittest.TestCase):
         }
         self.assertFalse(run_recap.owner_joined_meeting(transcript))
 
+    def test_owner_name_matching_uses_word_boundaries(self):
+        self.assertFalse(run_recap.owner_joined_meeting({"meeting_attendance": [{"name": "Shawna Fields"}]}))
+        self.assertFalse(run_recap.owner_joined_meeting({"meeting_attendance": [{"name": "Rashawn Patel"}]}))
+        self.assertTrue(run_recap.owner_joined_meeting({"meeting_attendance": [{"name": "Shawn Reddy"}]}))
+
     def test_missing_attendance_does_not_block_legacy_transcripts(self):
         transcript = {"meeting_attendees": [{"email": "shawn@example.com"}]}
         self.assertTrue(run_recap.owner_joined_meeting(transcript))
@@ -93,6 +98,17 @@ class TestSignature(unittest.TestCase):
     def test_replaces_other_attendee_signature(self):
         html = "<html><body><p>Notes.</p><p>Best,<br>Ibrahim</p></body></html>"
         out = run_recap.enforce_owner_signature(html)
+        self.assertIn("<p>Best,<br>Shawn</p>", out)
+        self.assertNotIn("Ibrahim", out)
+
+    def test_preserves_earlier_thanks_paragraph(self):
+        html = (
+            "<html><body><p>Thanks for meeting today. We covered launch timing.</p>"
+            "<p>Next step: send the launch plan.</p><p>Best,<br>Ibrahim</p></body></html>"
+        )
+        out = run_recap.enforce_owner_signature(html)
+        self.assertIn("Thanks for meeting today", out)
+        self.assertIn("Next step: send the launch plan", out)
         self.assertIn("<p>Best,<br>Shawn</p>", out)
         self.assertNotIn("Ibrahim", out)
 
