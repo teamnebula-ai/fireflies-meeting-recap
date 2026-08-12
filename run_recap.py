@@ -22,6 +22,8 @@ Recipient policy:
   - External/sales (>=1 outside attendee) → TWO emails:
       * internal debrief  → internal attendees ONLY (never the outside guest)
       * client recap      → ALL participants, using a separate client-safe template
+  - If the recap owner did not personally join the meeting (based on Fireflies
+    meeting_attendance), skip all recap sends/drafts.
   - Ambiguous (no emails, or outside guests but zero internal recipient, or fetch
     failed) → draft to RECAP_OWNER_EMAIL, no auto-send.
 
@@ -64,6 +66,7 @@ GEN_TIMEOUT = int(os.environ.get("RECAP_GEN_TIMEOUT", "600"))
 # Identity / routing
 INTERNAL_DOMAIN = os.environ.get("RECAP_INTERNAL_DOMAIN", "example.com")
 OWNER_EMAIL = os.environ.get("RECAP_OWNER_EMAIL", "")        # fallback/ambiguous draft target
+OWNER_DISPLAY_NAME = os.environ.get("RECAP_OWNER_DISPLAY_NAME", "Shawn")
 NOTIFY_TARGET = os.environ.get("RECAP_NOTIFY_TARGET", "")    # optional status pings (e.g. telegram:123)
 
 
@@ -106,7 +109,7 @@ def log(msg):
 def load_env():
     """Source RECAP_ENV_FILE into os.environ (KEY=VALUE, ignore #/blank)."""
     global GEN_BIN, GEN_MODEL, GEN_TIMEOUT, INTERNAL_DOMAIN, OWNER_EMAIL
-    global NOTIFY_TARGET, WRITING_SPEC, BLOCKED_DOMAINS, EMAIL_ALIASES
+    global OWNER_DISPLAY_NAME, NOTIFY_TARGET, WRITING_SPEC, BLOCKED_DOMAINS, EMAIL_ALIASES
     if not ENV_FILE.exists():
         log(f"note: env file {ENV_FILE} not present (relying on process env)")
     else:
@@ -123,6 +126,7 @@ def load_env():
     GEN_TIMEOUT = int(os.environ.get("RECAP_GEN_TIMEOUT", str(GEN_TIMEOUT)))
     INTERNAL_DOMAIN = os.environ.get("RECAP_INTERNAL_DOMAIN", INTERNAL_DOMAIN)
     OWNER_EMAIL = os.environ.get("RECAP_OWNER_EMAIL", OWNER_EMAIL)
+    OWNER_DISPLAY_NAME = os.environ.get("RECAP_OWNER_DISPLAY_NAME", OWNER_DISPLAY_NAME)
     NOTIFY_TARGET = os.environ.get("RECAP_NOTIFY_TARGET", NOTIFY_TARGET)
     WRITING_SPEC = Path(os.environ.get("RECAP_WRITING_SPEC", str(WRITING_SPEC)))
     BLOCKED_DOMAINS = _parse_domains(os.environ.get("RECAP_BLOCKED_DOMAINS", ""))
@@ -192,6 +196,7 @@ def fetch_transcript(meeting_id):
     q = ("query($id:String!){ transcript(id:$id){ id title dateString date "
          "duration transcript_url host_email organizer_email participants "
          "meeting_attendees { displayName email name } "
+         "meeting_attendance { name join_time leave_time } "
          "summary { overview action_items keywords bullet_gist outline } "
          "sentences { speaker_name text } } }")
     r = _req("POST", FIREFLIES_GQL,
@@ -225,6 +230,45 @@ def canonical_email(email):
 def is_blocked_recipient(email):
     domain = (email.split("@", 1)[1] if "@" in email else "").lower()
     return domain in BLOCKED_DOMAINS
+
+
+def _norm_name(value):
+    return " ".join(str(value or "").strip().lower().split())
+
+
+def owner_joined_meeting(transcript):
+    """True unless Fireflies attendance proves the recap owner was absent.
+
+    Fireflies separates invited calendar attendees (meeting_attendees) from the
+    people who actually joined (meeting_attendance). Shawn should not receive or
+    trigger recaps for meetings where Fireflies joined from his calendar but he
+    did not personally attend.
+
+    Older transcript payloads may not include meeting_attendance at all; keep
+    those flowing rather than blocking on missing legacy data.
+    """
+    if "meeting_attendance" not in transcript:
+        return True
+    attendance = transcript.get("meeting_attendance") or []
+    owner_names = [
+        _norm_name(n)
+        for n in os.environ.get("RECAP_OWNER_NAMES", "Shawn Reddy,Shawn").split(",")
+        if _norm_name(n)
+    ]
+    if not owner_names:
+        return True
+    for attendee in attendance:
+        name = _norm_name((attendee or {}).get("name"))
+        tokens = set(re.findall(r"\b[\w'-]+\b", name))
+        for owner in owner_names:
+            if not owner:
+                continue
+            if " " in owner:
+                if name == owner:
+                    return True
+            elif owner in tokens:
+                return True
+    return False
 
 
 def classify(transcript):
@@ -328,7 +372,7 @@ Use exactly this HTML structure:
 </table>
 
 <p>[Short, friendly closing inviting them to reply with questions.]</p>
-<p>Best,<br>[Meeting host name]</p>
+<p>Best,<br>Shawn</p>
 </body></html>
 """
 
@@ -401,6 +445,34 @@ def generate_json(prompt):
             last = f"rc={proc.returncode} stderr={proc.stderr[-300:]}"
         log(f"structured attempt {attempt} unusable: {last}")
     raise RuntimeError(f"structured generation failed: {last}")
+
+
+def _html_escape(value):
+    return (str(value or "")
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;"))
+
+
+def enforce_owner_signature(html):
+    """Deterministically sign every recap from Shawn, never from another attendee."""
+    out = _clean_html(html)
+    signature = f"<p>Best,<br>{_html_escape(OWNER_DISPLAY_NAME)}</p>"
+    body_match = re.search(r"(?is)</body>", out)
+    if not body_match:
+        return out + "\n" + signature
+
+    before_body = out[:body_match.start()]
+    paragraphs = list(re.finditer(r"(?is)<p[^>]*>.*?</p>", before_body))
+    if not paragraphs:
+        return out[:body_match.start()] + signature + "\n" + out[body_match.start():]
+
+    last = paragraphs[-1]
+    last_text = re.sub(r"(?is)<br\s*/?>", "\n", last.group(0))
+    last_text = re.sub(r"(?is)<[^>]+>", "", last_text).strip().lower()
+    if re.match(r"^(best|regards|thanks|thank you|sincerely|cheers)\b", last_text):
+        return before_body[:last.start()] + signature + before_body[last.end():] + out[body_match.start():]
+    return before_body + signature + "\n" + out[body_match.start():]
 
 
 def generate_html(fmt, transcript):
@@ -600,10 +672,19 @@ def main():
     title = transcript.get("title") or mid
     usable = bool(transcript.get("sentences") or transcript.get("summary"))
 
+    # Fireflies can record meetings Shawn was invited to, or where the bot joined
+    # from his calendar, even when he never personally joined. Those should not
+    # send recap emails or create owner drafts.
+    if transcript is not None and not owner_joined_meeting(transcript):
+        log(f"owner did not personally join \"{title}\" ({mid}) — recap disabled")
+        if not args.dry:
+            ledger_add(mid)
+        return
+
     # ----- ambiguous: draft the recap to the owner, never auto-send ------------
     if mode == "ambiguous":
         subject = subject_for(fmt, transcript)
-        html = (generate_html(fmt, transcript) if usable else
+        html = (enforce_owner_signature(generate_html(fmt, transcript)) if usable else
                 f"<html><body><p>Recap held for <b>{title}</b> (meeting {mid}). "
                 f"Reason: {reason}. The transcript could not be used.</p></body></html>")
         if args.dry:
@@ -661,7 +742,7 @@ def main():
 
     for s in sends:
         s["subject"] = subj_for_kind[s["kind"]]
-        s["html"] = generate_html(fmt_for_kind[s["kind"]], transcript)
+        s["html"] = enforce_owner_signature(generate_html(fmt_for_kind[s["kind"]], transcript))
         if s["kind"] == "client":
             bad = client_safety_violation(s["html"])
             if bad and not args.dry:

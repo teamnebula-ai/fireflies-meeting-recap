@@ -52,6 +52,72 @@ class TestClassify(unittest.TestCase):
             ["a@example.com"])
 
 
+class TestOwnerAttendance(unittest.TestCase):
+    def setUp(self):
+        self._orig_owner = run_recap.OWNER_EMAIL
+        self._orig_names = os.environ.get("RECAP_OWNER_NAMES")
+        run_recap.OWNER_EMAIL = "shawn@example.com"
+        os.environ["RECAP_OWNER_NAMES"] = "Shawn Reddy,Shawn"
+
+    def tearDown(self):
+        run_recap.OWNER_EMAIL = self._orig_owner
+        if self._orig_names is None:
+            os.environ.pop("RECAP_OWNER_NAMES", None)
+        else:
+            os.environ["RECAP_OWNER_NAMES"] = self._orig_names
+
+    def test_owner_joined_when_attendance_has_owner_name(self):
+        transcript = {"meeting_attendance": [{"name": "Shawn Reddy"}]}
+        self.assertTrue(run_recap.owner_joined_meeting(transcript))
+
+    def test_owner_did_not_join_when_only_invited_attendee(self):
+        transcript = {
+            "meeting_attendees": [{"email": "shawn@example.com", "displayName": "Shawn Reddy"}],
+            "meeting_attendance": [{"name": "Ibrahim Zia"}],
+        }
+        self.assertFalse(run_recap.owner_joined_meeting(transcript))
+
+    def test_owner_name_matching_uses_word_boundaries(self):
+        self.assertFalse(run_recap.owner_joined_meeting({"meeting_attendance": [{"name": "Shawna Fields"}]}))
+        self.assertFalse(run_recap.owner_joined_meeting({"meeting_attendance": [{"name": "Rashawn Patel"}]}))
+        self.assertTrue(run_recap.owner_joined_meeting({"meeting_attendance": [{"name": "Shawn Reddy"}]}))
+
+    def test_missing_attendance_does_not_block_legacy_transcripts(self):
+        transcript = {"meeting_attendees": [{"email": "shawn@example.com"}]}
+        self.assertTrue(run_recap.owner_joined_meeting(transcript))
+
+
+class TestSignature(unittest.TestCase):
+    def setUp(self):
+        self._orig_display = run_recap.OWNER_DISPLAY_NAME
+        run_recap.OWNER_DISPLAY_NAME = "Shawn"
+
+    def tearDown(self):
+        run_recap.OWNER_DISPLAY_NAME = self._orig_display
+
+    def test_replaces_other_attendee_signature(self):
+        html = "<html><body><p>Notes.</p><p>Best,<br>Ibrahim</p></body></html>"
+        out = run_recap.enforce_owner_signature(html)
+        self.assertIn("<p>Best,<br>Shawn</p>", out)
+        self.assertNotIn("Ibrahim", out)
+
+    def test_preserves_earlier_thanks_paragraph(self):
+        html = (
+            "<html><body><p>Thanks for meeting today. We covered launch timing.</p>"
+            "<p>Next step: send the launch plan.</p><p>Best,<br>Ibrahim</p></body></html>"
+        )
+        out = run_recap.enforce_owner_signature(html)
+        self.assertIn("Thanks for meeting today", out)
+        self.assertIn("Next step: send the launch plan", out)
+        self.assertIn("<p>Best,<br>Shawn</p>", out)
+        self.assertNotIn("Ibrahim", out)
+
+    def test_inserts_signature_when_missing(self):
+        html = "<html><body><p>Notes.</p></body></html>"
+        out = run_recap.enforce_owner_signature(html)
+        self.assertIn("<p>Best,<br>Shawn</p>\n</body>", out)
+
+
 class TestRouting(unittest.TestCase):
     def test_internal_one_send_to_all(self):
         allm = ["a@example.com", "b@example.com"]
