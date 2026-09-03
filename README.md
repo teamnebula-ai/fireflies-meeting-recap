@@ -11,10 +11,10 @@ decides who gets what:
 
 - **Internal meeting** (everyone is on your domain): one recap to all attendees.
 - **External / sales call** (an outside guest is present): an internal debrief,
-  plus a client-facing recap only when the guest's domain is explicitly allowed —
+  plus a client-facing recap only when the guest's domain is explicitly allowed:
   1. an **internal debrief** to your team only (the guest never receives it), and
-  2. a **client-facing recap** to **everyone**, written from a separate,
-     guard-railed template that carries no internal notes.
+  2. a **client-facing recap** to your team and allowed outside guests, written
+     from a separate, guard-railed template that carries no internal notes.
 - **Ambiguous** (no attendee emails, an outside-only call, or a fetch failure):
   a draft is held for the owner; nothing is sent automatically.
 
@@ -183,7 +183,7 @@ All configuration is environment variables (see
 
 ### Recipient safety
 
-Four deterministic (non-LLM) gates run on every send:
+Five deterministic (non-LLM) gates run on every send:
 
 - **Client allowlist.** Outside addresses receive a client-facing recap only
   when their domain appears in `RECAP_CLIENT_ALLOWED_DOMAINS`. The default is
