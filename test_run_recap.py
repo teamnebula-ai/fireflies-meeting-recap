@@ -18,6 +18,7 @@ os.environ.setdefault("RECAP_INTERNAL_DOMAIN", "example.com")
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import run_recap
 
@@ -116,6 +117,217 @@ class TestSignature(unittest.TestCase):
         html = "<html><body><p>Notes.</p></body></html>"
         out = run_recap.enforce_owner_signature(html)
         self.assertIn("<p>Best,<br>Shawn</p>\n</body>", out)
+
+    def test_removes_earlier_signer_before_appending_shawn(self):
+        html = (
+            "<html><body><p>Notes.</p><p>Best,<br>Ibrahim</p>"
+            "<p>Reply if I missed anything.</p></body></html>"
+        )
+        out = run_recap.enforce_owner_signature(html)
+        self.assertNotIn("Ibrahim", out)
+        self.assertEqual(out.count("Best,<br>Shawn"), 1)
+        self.assertIn("Reply if I missed anything", out)
+
+    def test_preserves_content_paragraph_beginning_with_thanks(self):
+        html = (
+            "<html><body><p>Notes.</p>"
+            "<p>Thanks for walking us through the inventory workflow.</p>"
+            "</body></html>"
+        )
+        out = run_recap.enforce_owner_signature(html)
+        self.assertIn("Thanks for walking us through the inventory workflow", out)
+        self.assertIn("<p>Best,<br>Shawn</p>", out)
+
+
+class TestHtmlFormatting(unittest.TestCase):
+    def setUp(self):
+        self._orig_display = run_recap.OWNER_DISPLAY_NAME
+        run_recap.OWNER_DISPLAY_NAME = "Shawn"
+
+    def tearDown(self):
+        run_recap.OWNER_DISPLAY_NAME = self._orig_display
+
+    def test_cleans_fences_and_model_chatter_without_touching_inline_styles(self):
+        raw = (
+            "Here is the recap:\n```html\n"
+            '<html><body style="font-family: Arial; color: #333;">'
+            "<p>Good talking with you today.</p></body></html>\n```\nHope this helps."
+        )
+        out = run_recap._clean_html(raw)
+        self.assertTrue(out.startswith("<html>"))
+        self.assertTrue(out.endswith("</html>"))
+        self.assertIn('style="font-family: Arial; color: #333;"', out)
+        self.assertNotIn("```", out)
+        self.assertNotIn("Here is the recap", out)
+
+    def test_repairs_missing_closing_body_and_html_tags(self):
+        out = run_recap._clean_html(
+            "<html><body><p>Good talking with you today.</p>"
+        )
+        self.assertEqual(
+            out,
+            "<html><body><p>Good talking with you today.</p>\n</body>\n</html>",
+        )
+
+    def test_complete_signed_email_passes_validation(self):
+        html = (
+            '<html><body style="font-family: Arial, sans-serif;">'
+            "<p>Hi Maya,</p><p>I enjoyed our conversation about the pilot.</p>"
+            "<ul><li>We agreed to review the scope Friday.</li></ul>"
+            "<p>Best,<br>Shawn</p></body></html>"
+        )
+        self.assertIsNone(run_recap.html_format_violation(html))
+
+    def test_rejects_placeholders_empty_collections_and_markdown(self):
+        samples = [
+            ("placeholder", "<html><body><p>Hi [client name],</p><p>Best,<br>Shawn</p></body></html>"),
+            ("empty list", "<html><body><ul>  </ul><p>Best,<br>Shawn</p></body></html>"),
+            ("empty table", "<html><body><table></table><p>Best,<br>Shawn</p></body></html>"),
+            ("empty list", "<html><body><ul><li> </li></ul><p>Best,<br>Shawn</p></body></html>"),
+            ("empty table", (
+                "<html><body><table><tr><td>&nbsp;</td></tr></table>"
+                "<p>Best,<br>Shawn</p></body></html>"
+            )),
+            ("markdown fence", "```html\n<html><body><p>Hi.</p><p>Best,<br>Shawn</p></body></html>\n```"),
+        ]
+        for expected, html in samples:
+            with self.subTest(expected=expected):
+                self.assertIn(expected, run_recap.html_format_violation(html))
+
+    def test_rejects_unbalanced_or_email_incompatible_markup(self):
+        samples = {
+            "nesting": (
+                "<html><body><p><strong>Hello.</p></strong>"
+                "<p>Best,<br>Shawn</p></body></html>"
+            ),
+            "unsupported <script>": (
+                "<html><body><script>alert(1)</script>"
+                "<p>Best,<br>Shawn</p></body></html>"
+            ),
+            "unsupported class attribute": (
+                '<html><body><p class="intro">Hello.</p>'
+                "<p>Best,<br>Shawn</p></body></html>"
+            ),
+            "onclick": (
+                '<html><body><p onclick="alert(1)">Hello.</p>'
+                "<p>Best,<br>Shawn</p></body></html>"
+            ),
+            "unsafe link": (
+                '<html><body><p><a href="javascript:alert(1)">Open</a></p>'
+                "<p>Best,<br>Shawn</p></body></html>"
+            ),
+            "onclick": (
+                '<html><body><p>Hello.<br onclick="alert(1)"/></p>'
+                "<p>Best,<br>Shawn</p></body></html>"
+            ),
+            "unsupported style attribute": (
+                '<html><body><p>Hello.<br style="background:url(https://bad.test/x)"/></p>'
+                "<p>Best,<br>Shawn</p></body></html>"
+            ),
+            "placement": (
+                "<html><body><p><table><tr><td>Bad layout</td></tr></table></p>"
+                "<p>Best,<br>Shawn</p></body></html>"
+            ),
+        }
+        for expected, html in samples.items():
+            with self.subTest(expected=expected):
+                self.assertIn(expected, run_recap.html_format_violation(html))
+
+    def test_rejects_incomplete_structure_and_wrong_signature(self):
+        self.assertIn(
+            "structure",
+            run_recap.html_format_violation(
+                "<html><body><p>Hello.</p><p>Best,<br>Shawn</p></body>"
+            ),
+        )
+        self.assertIn(
+            "signature",
+            run_recap.html_format_violation(
+                "<html><body><p>Hello.</p><p>Best,<br>Ibrahim</p></body></html>"
+            ),
+        )
+
+    def test_generation_retries_after_format_violation(self):
+        invalid = "<html><body><p>Hi [name],</p></body></html>"
+        valid = (
+            '<html><body style="font-family: Arial, sans-serif; color: #333; '
+            'line-height: 1.6; max-width: 760px; margin: 0 auto;">'
+            "<p>Hi Maya,</p><p>Your pilot timeline gave us a clear place to start.</p>"
+            "<h2 style=\"color: #1a73e8;\">Next steps</h2>"
+            "<ul><li>We'll send the scope Friday, then you can mark up any gaps.</li></ul>"
+            "<p>Best,<br>Shawn</p></body></html>"
+        )
+        responses = [
+            mock.Mock(returncode=0, stdout=invalid, stderr=""),
+            mock.Mock(returncode=0, stdout=valid, stderr=""),
+        ]
+        with mock.patch.object(run_recap, "_which", return_value=True), mock.patch.object(
+                run_recap.subprocess, "run", side_effect=responses) as run:
+            out = run_recap.generate_html("client", {"title": "Pilot planning"})
+        self.assertIn("Your pilot timeline gave us a clear place to start", out)
+        self.assertIn('style="font-family: Arial, sans-serif;', out)
+        self.assertEqual(out.count("Best,<br>Shawn"), 1)
+        self.assertEqual(run.call_count, 2)
+
+    def test_wrong_model_signer_is_repaired_without_another_generation(self):
+        wrong_signer = (
+            '<html><body style="font-family: Arial, sans-serif; color: #333; '
+            'line-height: 1.6; max-width: 760px; margin: 0 auto;">'
+            "<p>Hi Maya,</p><p>Your pilot timeline gave us a clear place to start.</p>"
+            "<h2>Next steps</h2><ul><li>We'll send the pilot scope Friday.</li></ul>"
+            "<p>Best,<br>Ibrahim</p></body></html>"
+        )
+        response = mock.Mock(returncode=0, stdout=wrong_signer, stderr="")
+        with mock.patch.object(run_recap, "_which", return_value=True), mock.patch.object(
+                run_recap.subprocess, "run", return_value=response) as run:
+            out = run_recap.generate_html("client", {"title": "Pilot planning"})
+        self.assertIn("<p>Best,<br>Shawn</p>", out)
+        self.assertNotIn("Ibrahim", out)
+        self.assertEqual(run.call_count, 1)
+
+
+class TestRecapVoice(unittest.TestCase):
+    def test_rejects_canned_email_copy(self):
+        html = (
+            "<html><body><p>It was great connecting about several important topics.</p>"
+            "<p>Best,<br>Shawn</p></body></html>"
+        )
+        self.assertIn("canned phrase", run_recap.recap_voice_violation(
+            html, {"title": "Rivus pilot"}))
+
+    def test_rejects_copy_with_no_meeting_anchor(self):
+        html = (
+            "<html><body><p>We covered the plan and will follow up soon.</p>"
+            "<p>Best,<br>Shawn</p></body></html>"
+        )
+        self.assertEqual(
+            run_recap.recap_voice_violation(
+                html, {"title": "Rivus security pilot", "summary": "Maya owns access"}),
+            "no concrete meeting detail",
+        )
+
+    def test_metadata_keys_do_not_count_as_meeting_details(self):
+        html = (
+            "<html><body><p>Reply to this email if you have questions.</p>"
+            "<p>Best,<br>Shawn</p></body></html>"
+        )
+        transcript = {
+            "title": "ERP warehouse review",
+            "meeting_attendees": [{"email": "maya@example.com"}],
+            "sentences": [{"text": "Inventory reconciliation is due Friday"}],
+        }
+        self.assertEqual(
+            run_recap.recap_voice_violation(html, transcript),
+            "no concrete meeting detail",
+        )
+
+    def test_accepts_specific_detail_from_transcript(self):
+        html = (
+            "<html><body><p>Maya, we'll send the Rivus pilot scope Friday.</p>"
+            "<p>Best,<br>Shawn</p></body></html>"
+        )
+        self.assertIsNone(run_recap.recap_voice_violation(
+            html, {"title": "Rivus security pilot", "summary": "Maya owns access"}))
 
 
 class TestRouting(unittest.TestCase):

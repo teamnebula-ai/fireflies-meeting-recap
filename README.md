@@ -32,7 +32,7 @@ Fireflies "transcription completed"
                               2. dedupe    permanent ledger (survives restarts)
                               3. fetch     Fireflies GraphQL
                               4. classify  recipients/mode by email domain
-                              5. generate  one-shot LLM CLI → recap HTML body only
+                              5. generate  LLM draft → deterministic HTML cleanup/validation
                               6. send      Composio Gmail (send / draft)
                               7. reconcile search/update/create Linear work
                               8. notify    optional status ping
@@ -209,6 +209,13 @@ Five deterministic (non-LLM) gates run on every send:
 - **Owner signature.** Generated HTML passes through a final deterministic
   rewrite that replaces any model-written sign-off with `Best,<br>Shawn` (or
   the exact value of `RECAP_OWNER_DISPLAY_NAME`) before draft or delivery.
+- **Email formatting.** The generator strips model chatter and Markdown fences,
+  preserves inline email styles, repairs missing closing container tags, and
+  validates the complete `<html><body>...</body></html>` document. Placeholder
+  text, empty lists or tables, malformed structure, unsafe attributes, and
+  email-incompatible layout trigger a fresh generation attempt instead of
+  reaching Gmail. A separate voice check rejects canned phrases and drafts
+  that do not carry a concrete detail from the meeting.
 
 ## Linear reconciliation
 
@@ -251,6 +258,8 @@ model you want. The internal/sales writing guidance lives in
 [`templates/writing_spec.md`](templates/writing_spec.md) — edit it to match your
 team's voice. The client-facing template is `CLIENT_SPEC` in `run_recap.py`,
 kept separate on purpose so internal framing can't leak into a client email.
+Both prompts ask for a direct, conversational note tied to the actual meeting,
+with brief paragraphs and only the sections that contain useful information.
 
 ## Test a meeting without sending
 
