@@ -34,6 +34,7 @@ Usage:
     --dry : fetch + classify + generate + print; send nothing; don't claim/mark seen.
 """
 import argparse
+import html as html_lib
 import json
 import os
 import re
@@ -43,6 +44,7 @@ import time
 import urllib.request
 import urllib.error
 from datetime import datetime
+from html.parser import HTMLParser
 from pathlib import Path
 
 import linear_recap
@@ -92,6 +94,17 @@ def _parse_aliases(raw):
 # guarantee holds even when such a person joins a call about something else.
 BLOCKED_DOMAINS = _parse_domains(os.environ.get("RECAP_BLOCKED_DOMAINS", ""))
 
+
+def _parse_terms(raw):
+    return {" ".join(t.strip().lower().split())
+            for t in (raw or "").split(",") if t.strip()}
+
+
+# People, project names, contract labels, and other topics that make a meeting
+# unsuitable for any client-facing recap. Internal recaps remain enabled.
+BLOCKED_EXTERNAL_TERMS = _parse_terms(
+    os.environ.get("RECAP_BLOCKED_EXTERNAL_TERMS", ""))
+
 # Teammates who join meetings under a second address (e.g. an agency account)
 # but are internal. Alias SPECIFIC people, not whole domains — aliasing a domain
 # would classify a genuine guest at that domain as internal.
@@ -109,7 +122,8 @@ def log(msg):
 def load_env():
     """Source RECAP_ENV_FILE into os.environ (KEY=VALUE, ignore #/blank)."""
     global GEN_BIN, GEN_MODEL, GEN_TIMEOUT, INTERNAL_DOMAIN, OWNER_EMAIL
-    global OWNER_DISPLAY_NAME, NOTIFY_TARGET, WRITING_SPEC, BLOCKED_DOMAINS, EMAIL_ALIASES
+    global OWNER_DISPLAY_NAME, NOTIFY_TARGET, WRITING_SPEC, BLOCKED_DOMAINS
+    global BLOCKED_EXTERNAL_TERMS, EMAIL_ALIASES
     if not ENV_FILE.exists():
         log(f"note: env file {ENV_FILE} not present (relying on process env)")
     else:
@@ -130,6 +144,8 @@ def load_env():
     NOTIFY_TARGET = os.environ.get("RECAP_NOTIFY_TARGET", NOTIFY_TARGET)
     WRITING_SPEC = Path(os.environ.get("RECAP_WRITING_SPEC", str(WRITING_SPEC)))
     BLOCKED_DOMAINS = _parse_domains(os.environ.get("RECAP_BLOCKED_DOMAINS", ""))
+    BLOCKED_EXTERNAL_TERMS = _parse_terms(
+        os.environ.get("RECAP_BLOCKED_EXTERNAL_TERMS", ""))
     EMAIL_ALIASES = _parse_aliases(os.environ.get("RECAP_EMAIL_ALIASES", ""))
 
 
@@ -236,6 +252,26 @@ def is_blocked_recipient(email):
     return domain in BLOCKED_DOMAINS
 
 
+def meeting_has_blocked_external_context(transcript):
+    """True when a blocked domain, person, or topic appears anywhere in a meeting."""
+    text = " ".join(json.dumps(transcript or {}, ensure_ascii=False).lower().split())
+    for email in re.findall(r"[a-z0-9._%+\-]+@([a-z0-9.\-]+)", text):
+        if email.rstrip(".") in BLOCKED_DOMAINS:
+            return True
+    for term in BLOCKED_EXTERNAL_TERMS:
+        pattern = rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])"
+        if re.search(pattern, text):
+            return True
+    return False
+
+
+def apply_external_context_gate(sends, transcript):
+    """Suppress every client-facing route when the meeting is blocked."""
+    if not meeting_has_blocked_external_context(transcript):
+        return sends
+    return [send for send in sends if send.get("kind") != "client"]
+
+
 def _norm_name(value):
     return " ".join(str(value or "").strip().lower().split())
 
@@ -307,9 +343,8 @@ def route_sends(mode, internal_recipients, all_emails):
     guests is the 'client' send, which carries the client-safe HTML.
 
     Blocked domains (RECAP_BLOCKED_DOMAINS) are stripped from every route.
-    Classification upstream still sees the true attendee list — a call with a
-    blocked guest still counts as 'sales', so the team gets the candid debrief —
-    but no recap is ever ADDRESSED to a blocked inbox.
+    Classification upstream still sees the true attendee list, so a call with a
+    blocked guest still counts as 'sales' and the team gets the candid debrief.
     """
     sendable = lambda emails: [e for e in emails if not is_blocked_recipient(e)]
     if mode == "internal":
@@ -350,27 +385,41 @@ ABSOLUTE RULES — the reader is the client. NEVER include any of the following:
 - Candid/internal assessments, "what didn't land", red flags, or buying signals.
 - Internal-only tasks (CRM updates, "build a demo for their use case", research).
 - The Fireflies transcript/recording link (that is internal only).
-Write warm, professional, concise. Use "we" for our side and "you" for the client.
+Write like Shawn is following up personally after the call:
+- Open with a specific moment, decision, question, or shared goal from the meeting.
+- Keep any thanks brief and connected to what the client contributed.
+- Use a natural, conversational rhythm. "We" means Team Nebula and "you" means
+  the client.
+- Avoid canned openers, corporate filler, fake enthusiasm, em dashes, and repeated
+  sentence patterns.
+- Never invent familiarity or imply a relationship the transcript does not show.
+- Omit any section, list, or row with no real content. Never emit placeholders.
 
-Use exactly this HTML structure:
+HTML RULES:
+- Return one complete document from <html> through </html>.
+- Use inline styles only. Do not use CSS classes, <style>, flexbox, grid, scripts,
+  images, Markdown, or emoji headings.
+- Keep paragraphs short and preserve the simple, single-column layout below.
+- End with exactly <p>Best,<br>Shawn</p>.
 
-<html><body style="font-family: Arial, sans-serif; color: #333; line-height: 1.7; max-width: 800px;">
+Use this HTML structure, omitting optional sections that have no supported content:
+
+<html><body style="font-family: Arial, sans-serif; color: #333; line-height: 1.6; max-width: 760px; margin: 0 auto;">
 <p>Hi [first names of the client attendees, comma-separated],</p>
-<p>[1-2 warm sentences thanking them for their time and stating the headline of the conversation.]</p>
+<p>[One or two natural sentences tied to a real detail from the conversation.]</p>
 
-<h2 style="color: #1a73e8;">What we covered</h2>
-<ul>
-  <li>[Neutral, factual recap point — what was discussed, in client-appropriate language.]</li>
-  <li>[Another point...]</li>
+<h2 style="color: #1a73e8; font-size: 18px; margin: 24px 0 8px;">What we covered</h2>
+<ul style="margin: 0 0 16px; padding-left: 22px;">
+  <li style="margin-bottom: 6px;">[Neutral, factual recap point in client-appropriate language.]</li>
 </ul>
 
-<h2 style="color: #1a73e8;">What we agreed</h2>
-<ul>
+<h2 style="color: #1a73e8; font-size: 18px; margin: 24px 0 8px;">What we agreed</h2>
+<ul style="margin: 0 0 16px; padding-left: 22px;">
   <li>[Any decisions or agreements reached together. Omit this section entirely if none.]</li>
 </ul>
 
-<h2 style="color: #1a73e8;">Next steps</h2>
-<table style="width: 100%; border-collapse: collapse; margin-bottom: 16px;">
+<h2 style="color: #1a73e8; font-size: 18px; margin: 24px 0 8px;">Next steps</h2>
+<table role="presentation" style="width: 100%; border-collapse: collapse; margin: 0 0 18px;">
   <tr style="background: #f8f9fa;"><td style="padding: 8px; border: 1px solid #ddd; width: 120px;"><strong>Us</strong></td><td style="padding: 8px; border: 1px solid #ddd;">[What WE committed to do for them, with timing if stated.]</td></tr>
   <tr><td style="padding: 8px; border: 1px solid #ddd;"><strong>You</strong></td><td style="padding: 8px; border: 1px solid #ddd;">[What THEY said they'd do, phrased as a friendly reminder. Omit row if none.]</td></tr>
 </table>
@@ -397,14 +446,202 @@ def client_safety_violation(html):
 
 def _clean_html(text):
     out = (text or "").strip()
-    if out.startswith("```"):
-        lines = out.splitlines()
-        if lines and lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].strip().startswith("```"):
-            lines = lines[:-1]
-        out = "\n".join(lines).strip()
+    # Keep only the email document when a model adds a preamble, a Markdown
+    # fence, or trailing commentary. This does not rewrite any HTML attributes,
+    # so the inline styles that email clients rely on remain byte-for-byte intact.
+    start = re.search(r"(?is)<html\b", out)
+    if start:
+        out = out[start.start():]
+    end = list(re.finditer(r"(?is)</html\s*>", out))
+    if end:
+        out = out[:end[-1].end()]
+
+    # A truncated model response often contains a complete body but omits only
+    # the final container tags. Repair that narrow case; the validator rejects
+    # missing opening tags or malformed nesting rather than guessing.
+    if re.match(r"(?is)^<html\b", out) and re.search(r"(?is)<body\b", out):
+        if not re.search(r"(?is)</body\s*>", out):
+            html_close = re.search(r"(?is)</html\s*>\s*$", out)
+            if html_close:
+                out = out[:html_close.start()] + "\n</body>\n" + out[html_close.start():]
+            else:
+                out += "\n</body>"
+        if not re.search(r"(?is)</html\s*>\s*$", out):
+            out += "\n</html>"
     return out
+
+
+class _EmailHTMLValidator(HTMLParser):
+    """Small strict validator for the intentionally limited recap markup."""
+
+    _allowed = {
+        "a", "body", "br", "h1", "h2", "h3", "hr", "html", "li", "ol",
+        "p", "strong", "table", "tbody", "td", "th", "thead", "tr", "ul",
+    }
+    _void = {"br", "hr"}
+    _parents = {
+        "html": {None},
+        "body": {"html"},
+        "h1": {"body"}, "h2": {"body"}, "h3": {"body"},
+        "hr": {"body"}, "p": {"body", "li", "td", "th"},
+        "ul": {"body", "li", "td"}, "ol": {"body", "li", "td"},
+        "li": {"ul", "ol"}, "table": {"body", "td"},
+        "thead": {"table"}, "tbody": {"table"},
+        "tr": {"table", "thead", "tbody"}, "td": {"tr"}, "th": {"tr"},
+        "a": {"p", "li", "td", "th"}, "strong": {"p", "li", "td", "th", "a"},
+        "br": {"p", "li", "td", "th"},
+    }
+    _attrs = {
+        "a": {"href", "style"}, "body": {"style"}, "h1": {"style"},
+        "h2": {"style"}, "h3": {"style"}, "hr": {"style"}, "li": {"style"},
+        "ol": {"style"}, "p": {"style"}, "strong": {"style"},
+        "table": {"role", "style"}, "tbody": {"style"}, "td": {"style"},
+        "th": {"style"}, "thead": {"style"}, "tr": {"style"}, "ul": {"style"},
+    }
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.stack = []
+        self.violation = None
+
+    def _validate_tag(self, tag, attrs):
+        tag = tag.lower()
+        if tag not in self._allowed:
+            self.violation = self.violation or f"unsupported <{tag}> tag"
+            return tag
+        parent = self.stack[-1] if self.stack else None
+        if parent not in self._parents.get(tag, set()):
+            self.violation = self.violation or f"invalid <{tag}> placement"
+        allowed_attrs = self._attrs.get(tag, set())
+        for name, value in attrs:
+            name = name.lower()
+            if name not in allowed_attrs:
+                self.violation = self.violation or f"unsupported {name} attribute"
+            if name == "href" and not re.match(r"(?is)^https?://", value or ""):
+                self.violation = self.violation or "unsafe link URL"
+            if name == "style" and re.search(
+                    r"(?is)(?:expression\s*\(|url\s*\(|display\s*:\s*(?:flex|grid))",
+                    value or ""):
+                self.violation = self.violation or "unsupported email styling"
+        return tag
+
+    def handle_starttag(self, tag, attrs):
+        tag = self._validate_tag(tag, attrs)
+        if tag not in self._void:
+            self.stack.append(tag)
+
+    def handle_startendtag(self, tag, attrs):
+        tag = self._validate_tag(tag, attrs)
+        if tag not in self._void:
+            self.violation = self.violation or f"unsupported self-closing <{tag}> tag"
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if tag in self._void:
+            return
+        if not self.stack or self.stack[-1] != tag:
+            self.violation = self.violation or f"malformed <{tag}> nesting"
+            return
+        self.stack.pop()
+
+    def result(self):
+        if self.violation:
+            return self.violation
+        if self.stack:
+            return f"unclosed <{self.stack[-1]}> tag"
+        return None
+
+
+def html_format_violation(html):
+    """Return a deterministic email-format violation, or None when sendable."""
+    value = (html or "").strip()
+    if "```" in value:
+        return "markdown fence"
+    if not re.match(
+            r"(?is)^<html\b[^>]*>\s*<body\b[^>]*>.*</body\s*>\s*</html\s*>$",
+            value):
+        return "incomplete html/body structure"
+    for tag in ("html", "body"):
+        if len(re.findall(fr"(?is)<{tag}\b", value)) != 1 or len(
+                re.findall(fr"(?is)</{tag}\s*>", value)) != 1:
+            return f"malformed {tag} structure"
+    parser = _EmailHTMLValidator()
+    parser.feed(value)
+    parser.close()
+    tag_violation = parser.result()
+    if tag_violation:
+        return tag_violation
+    if re.search(r"(?is)\[[^\[\]]+\]", value):
+        return "placeholder text"
+    for listing in re.findall(r"(?is)<(?:ul|ol)\b[^>]*>(.*?)</(?:ul|ol)\s*>", value):
+        items = re.findall(r"(?is)<li\b[^>]*>(.*?)</li\s*>", listing)
+        if not any(_html_text(item) for item in items):
+            return "empty list"
+    for table in re.findall(r"(?is)<table\b[^>]*>(.*?)</table\s*>", value):
+        cells = re.findall(r"(?is)<t[dh]\b[^>]*>(.*?)</t[dh]\s*>", table)
+        if not any(_html_text(cell) for cell in cells):
+            return "empty table"
+
+    owner = re.escape(_html_escape(OWNER_DISPLAY_NAME))
+    signature = (
+        rf"(?is)<p\b[^>]*>\s*Best,\s*<br\s*/?>\s*{owner}\s*</p>"
+        rf"\s*</body\s*>\s*</html\s*>$"
+    )
+    if not re.search(signature, value):
+        return "missing or malformed owner signature"
+    return None
+
+
+_CANNED_RECAP_PHRASES = re.compile(
+    r"\b(i hope this (?:email|message) finds you well|it was great connecting|"
+    r"thank you for (?:the )?productive discussion|important topics|"
+    r"aligned on next steps|valuable insights)\b", re.IGNORECASE)
+_ANCHOR_STOP_WORDS = {
+    "about", "after", "again", "could", "discussion", "from", "have", "important",
+    "into", "meeting", "next", "notes", "project", "recap", "shawn", "steps",
+    "their", "there", "these", "they", "this", "today", "with", "would", "your",
+}
+
+
+def _html_text(value):
+    text = re.sub(r"(?is)<[^>]+>", " ", value or "")
+    return " ".join(html_lib.unescape(text).replace("\xa0", " ").split())
+
+
+def _meeting_anchor_values(value, key=""):
+    """Yield human meeting content while excluding transport metadata."""
+    ignored = {"datestring", "duration", "email", "id", "transcript_url", "url"}
+    if key.lower() in ignored:
+        return
+    if isinstance(value, dict):
+        for child_key, child in value.items():
+            yield from _meeting_anchor_values(child, str(child_key))
+    elif isinstance(value, (list, tuple)):
+        for child in value:
+            yield from _meeting_anchor_values(child, key)
+    elif isinstance(value, str):
+        yield value
+
+
+def recap_voice_violation(html, transcript):
+    """Reject canned copy or a recap with no concrete transcript anchor."""
+    text = _html_text(html)
+    canned = _CANNED_RECAP_PHRASES.search(text)
+    if canned:
+        return f"canned phrase {canned.group(0)!r}"
+    source = " ".join(_meeting_anchor_values(transcript or {}))
+    anchors = {
+        token.lower() for token in re.findall(r"[A-Za-z0-9][A-Za-z0-9'_-]{3,}", source)
+        if token.lower() not in _ANCHOR_STOP_WORDS
+    }
+    output_tokens = {
+        token.lower() for token in re.findall(r"[A-Za-z0-9][A-Za-z0-9'_-]{3,}", text)
+    }
+    if anchors:
+        matches = anchors.intersection(output_tokens)
+        if not matches or (len(matches) < 2 and not any(len(word) >= 5 for word in matches)):
+            return "no concrete meeting detail"
+    return None
 
 
 def _clean_json(text):
@@ -467,16 +704,25 @@ def enforce_owner_signature(html):
         return out + "\n" + signature
 
     before_body = out[:body_match.start()]
-    paragraphs = list(re.finditer(r"(?is)<p[^>]*>.*?</p>", before_body))
-    if not paragraphs:
-        return out[:body_match.start()] + signature + "\n" + out[body_match.start():]
 
-    last = paragraphs[-1]
-    last_text = re.sub(r"(?is)<br\s*/?>", "\n", last.group(0))
-    last_text = re.sub(r"(?is)<[^>]+>", "", last_text).strip().lower()
-    if re.match(r"^(best|regards|thanks|thank you|sincerely|cheers)\b", last_text):
-        return before_body[:last.start()] + signature + before_body[last.end():] + out[body_match.start():]
-    return before_body + signature + "\n" + out[body_match.start():]
+    def remove_signoff(match):
+        inner = re.sub(r"(?is)^<p[^>]*>|</p>$", "", match.group(0))
+        inner = re.sub(r"(?is)<br\s*/?>", "\n", inner)
+        lines = [
+            _html_text(line).strip(" ,")
+            for line in inner.splitlines() if _html_text(line).strip(" ,")
+        ]
+        closings = {"best", "regards", "thanks", "thank you", "sincerely", "cheers"}
+        if not lines or lines[0].lower() not in closings:
+            return match.group(0)
+        # A sign-off contains only the closing and an optional short signer name.
+        # This keeps genuine paragraphs such as "Thanks for walking us through...".
+        if len(lines) <= 2 and (len(lines) == 1 or len(lines[1].split()) <= 4):
+            return ""
+        return match.group(0)
+
+    without_signoffs = re.sub(r"(?is)<p\b[^>]*>.*?</p>", remove_signoff, before_body)
+    return without_signoffs.rstrip() + "\n" + signature + "\n" + out[body_match.start():]
 
 
 def generate_html(fmt, transcript):
@@ -504,7 +750,7 @@ def generate_html(fmt, transcript):
         )
     else:
         fmt_label = ("INTERNAL MEETING (standup/planning/retro)" if fmt == "internal"
-                     else "EXTERNAL / SALES CALL — internal debrief")
+                     else "EXTERNAL / SALES CALL, internal debrief")
         prompt = (
             f"{writing_spec()}\n\n"
             f"========================================================\n"
@@ -516,8 +762,8 @@ def generate_html(fmt, transcript):
             f"{fmt_label} template and the quality standards above. Output raw HTML "
             f"starting with <html> and ending with </html>. No preamble, no "
             f"commentary, no code fences, no To/From/Subject lines. Never invent "
-            f"facts, owners, deadlines, or commitments — if an owner or deadline "
-            f"was not stated, write \"Not stated\".\n\n"
+            f"facts, owners, deadlines, or commitments. Omit unsupported details "
+            f"and empty sections.\n\n"
             f"TRANSCRIPT (JSON):\n{ctx}"
         )
     sub_env = dict(os.environ)
@@ -532,11 +778,13 @@ def generate_html(fmt, transcript):
         except subprocess.TimeoutExpired:
             last = f"timeout {GEN_TIMEOUT}s"
             continue
-        html = _clean_html(proc.stdout)
-        if proc.returncode == 0 and "<html" in html.lower() and len(html) > 200:
+        html = enforce_owner_signature(_clean_html(proc.stdout))
+        violation = html_format_violation(html) or recap_voice_violation(html, transcript)
+        if proc.returncode == 0 and not violation and len(html) > 200:
             log(f"gen ok ({time.monotonic()-t0:.1f}s, {len(html)} chars)")
             return html
-        last = f"rc={proc.returncode} len={len(html)} stderr={proc.stderr[-300:]}"
+        last = (f"rc={proc.returncode} len={len(html)} format={violation or 'too short'} "
+                f"stderr={proc.stderr[-300:]}")
         log(f"attempt {attempt} unusable: {last}")
     sys.exit(f"ERROR: generation failed: {last}")
 
@@ -715,7 +963,10 @@ def main():
 
     # ----- internal / sales: build the send plan -------------------------------
     all_emails = attendee_emails(transcript)
-    sends = route_sends(mode, recipients, all_emails)
+    sends = apply_external_context_gate(
+        route_sends(mode, recipients, all_emails), transcript)
+    if mode == "sales" and meeting_has_blocked_external_context(transcript):
+        log(f'client-facing recap blocked by meeting context for "{title}" ({mid})')
 
     # Safety invariant: the internal debrief must never reach an external address.
     external = [e for e in all_emails if not e.endswith("@" + INTERNAL_DOMAIN)]
@@ -770,8 +1021,8 @@ def main():
     results = []
     for s in sends:
         # Belt-and-suspenders: route_sends already strips blocked domains, but
-        # re-filter at the send boundary so no future routing change can ever
-        # address an automated recap to a blocked inbox.
+        # Re-filter at the send boundary so no future routing change can address
+        # an automated recap to a blocked inbox.
         s["recipients"] = [e for e in s["recipients"] if not is_blocked_recipient(e)]
         if not s["recipients"]:
             continue

@@ -1,121 +1,98 @@
-# Meeting recap — writing spec
+# Meeting recap writing spec
 
-This file is the **writing guidance** fed to the generation step for INTERNAL
-recaps and EXTERNAL/SALES internal debriefs. It is intentionally generic — edit
-it to match your team's voice, sections, and priorities. (The client-facing
-template lives separately in `run_recap.py` as `CLIENT_SPEC` so internal framing
-can never leak into a client email.)
+Write the recap as a useful follow-up from Shawn, not as generated meeting
+minutes. The reader should recognize the conversation they just had.
 
-General standards for every recap:
+## Voice
 
-1. Specificity over generality. Capture decisions, named owners, dates, numbers,
-   tools, and exact commitments — not vague summaries.
-2. Lead with the decision. Each topic section should state what was decided, not
-   just what was discussed.
-3. Pull action items from the transcript, not only the auto-summary. Informal
-   commitments ("I'll set that up") count.
-4. Group intelligently. A 30-min call has ~3-5 sections; a long call ~6-8.
-5. Always link the recording/transcript at the bottom of INTERNAL recaps.
-6. Never invent owners or due dates. If an owner or deadline was not stated,
-   write "Not stated".
+- Open with a concrete decision, useful moment, or shared goal from the call.
+- Sound conversational and direct. Use names when the transcript makes them
+  clear, and use contractions where they fit.
+- Keep thanks brief and specific. Avoid canned lines such as "It was great
+  connecting," "Thank you for the productive discussion," and "I hope this
+  message finds you well."
+- Use active voice and plain language. Avoid corporate filler, fake enthusiasm,
+  em dashes, and repeated sentence patterns.
+- Never invent familiarity, facts, owners, dates, or commitments.
 
-Priority tags: 🔴 Today · 🟡 This week · 🟢 Ongoing.
+## Content
 
----
+1. Lead with what changed or what matters next. Do not narrate the agenda.
+2. Capture named owners, dates, numbers, tools, decisions, and open questions.
+3. Pull commitments from the transcript as well as the auto-summary.
+4. Use only the sections the meeting earned. Omit empty sections, lists, table
+   rows, and headings. Never print placeholders or "Not stated."
+5. Keep a short meeting to two or three sections. Add sections only when they
+   make the recap easier to scan.
+6. Put the Fireflies recording link at the bottom of internal recaps only.
 
-## Email HTML Structure — Internal Meetings
+Priority labels, when the transcript supports timing: Today, This week,
+Ongoing. Do not infer a priority from tone.
 
-Use for standups, planning, retros, and other all-internal meetings.
+## HTML rules
+
+- Return one complete document from `<html>` through `</html>`.
+- Use the inline styles shown below. Do not use CSS classes, `<style>`, flexbox,
+  grid, scripts, images, Markdown, or emoji headings.
+- Keep paragraphs short. Use `<ul>` for recap points and the simple table for
+  actions. Omit a list or table when it would be empty.
+- End with exactly `<p>Best,<br>Shawn</p>`.
+
+## Internal meeting
+
+Use for standups, planning, retros, and other all-internal meetings. Adapt the
+headings to the conversation instead of copying generic labels.
 
 ```html
-<html><body style="font-family: Arial, sans-serif; color: #333; line-height: 1.7; max-width: 800px;">
+<html><body style="font-family: Arial, sans-serif; color: #333; line-height: 1.6; max-width: 760px; margin: 0 auto;">
+<p>Hi team,</p>
+<p>[A natural opening tied to the main decision, result, or next move.]</p>
 
-<p>Team,</p>
-<p>[1-2 sentence overview of what the meeting covered and how long it ran.]</p>
-
-<hr style="border: none; border-top: 2px solid #1a73e8; margin: 24px 0;">
-
-<h2 style="color: #1a73e8;">🧭 Meeting Overview</h2>
-<p>[3-5 sentence high-level summary of the major topics.]</p>
-
-<hr style="border: none; border-top: 1px solid #ddd; margin: 24px 0;">
-
-<!-- One numbered section per major topic -->
-<h2 style="color: #1a73e8;">1. [Topic Title]</h2>
-<p><strong>Decision:</strong> [State it clearly if one was made; omit this line if no decision.]</p>
-<ul>
-  <li><strong>[Sub-topic]:</strong> [Specifics — names, tools, numbers.]</li>
+<h2 style="color: #1a73e8; font-size: 18px; margin: 24px 0 8px;">[Specific topic heading]</h2>
+<ul style="margin: 0 0 16px; padding-left: 22px;">
+  <li style="margin-bottom: 6px;">[Decision or concrete detail.]</li>
 </ul>
 
-<hr style="border: none; border-top: 2px solid #1a73e8; margin: 24px 0;">
-
-<h2 style="color: #1a73e8;">✅ Action Items by Owner</h2>
-<h3 style="color: #333; border-bottom: 1px solid #ddd; padding-bottom: 4px;">[Person]</h3>
-<table style="width: 100%; border-collapse: collapse; margin-bottom: 20px;">
-  <tr style="background: #f8f9fa;">
-    <td style="padding: 8px; border: 1px solid #ddd;">[Specific, actionable item]</td>
-    <td style="padding: 8px; border: 1px solid #ddd; width: 110px; text-align: center;">🔴 Today</td>
+<h2 style="color: #1a73e8; font-size: 18px; margin: 24px 0 8px;">Next steps</h2>
+<table role="presentation" style="width: 100%; border-collapse: collapse; margin: 0 0 18px;">
+  <tr>
+    <td style="padding: 9px; border: 1px solid #ddd; width: 120px;"><strong>[Owner]</strong></td>
+    <td style="padding: 9px; border: 1px solid #ddd;">[Specific commitment and stated timing.]</td>
   </tr>
 </table>
 
-<hr style="border: none; border-top: 2px solid #1a73e8; margin: 24px 0;">
-<p>Full transcript and recording available on <a href="[transcript URL]">Fireflies</a>.</p>
-<p>[Short closing line reminding the team to check their action items and flag questions.]</p>
-<p>– [Sender name]</p>
+<p style="margin-top: 22px;">Full transcript and recording: <a href="[transcript URL]">Fireflies</a></p>
+<p>[A short closing that fits the discussion.]</p>
+<p>Best,<br>Shawn</p>
 </body></html>
 ```
 
----
+## External or sales call, internal debrief
 
-## Email HTML Structure — External / Sales Calls (internal debrief)
-
-Use when an outside guest was present. **This email is INTERNAL ONLY — never
-sent to the guest.** Keep it factual and useful to your team. Adapt the sections
-to whatever your team actually tracks.
+This version goes to Team Nebula only. Keep it candid and useful without
+turning it into a sales scorecard. Name the people involved, what they need,
+what Team Nebula committed to, and what could affect the next conversation.
 
 ```html
-<html><body style="font-family: Arial, sans-serif; color: #333; line-height: 1.7; max-width: 800px;">
+<html><body style="font-family: Arial, sans-serif; color: #333; line-height: 1.6; max-width: 760px; margin: 0 auto;">
+<p>Hi team,</p>
+<p>[A direct opening with who joined and the clearest takeaway.]</p>
 
-<p>Team,</p>
-<p>[1-2 sentence context: who we met with, what kind of call, the headline takeaway.]</p>
-
-<hr style="border: none; border-top: 2px solid #1a73e8; margin: 24px 0;">
-
-<h2 style="color: #1a73e8;">🏢 Who We Met</h2>
-<ul>
-  <li><strong>Company / people:</strong> [Names + roles from their side.]</li>
-  <li><strong>Our side:</strong> [Who attended from our team.]</li>
+<h2 style="color: #1a73e8; font-size: 18px; margin: 24px 0 8px;">What matters</h2>
+<ul style="margin: 0 0 16px; padding-left: 22px;">
+  <li style="margin-bottom: 6px;">[Their need, constraint, reaction, or decision.]</li>
 </ul>
 
-<h2 style="color: #1a73e8;">🎯 Their Needs</h2>
-<ul>
-  <li>[What they're trying to solve, in their own words where useful.]</li>
-</ul>
-
-<h2 style="color: #1a73e8;">💡 What We Discussed / Showed</h2>
-<ul>
-  <li>[What we proposed or demoed and how they responded.]</li>
-</ul>
-
-<h2 style="color: #1a73e8;">⚠️ Open Questions & Concerns</h2>
-<ul>
-  <li>[Anything unresolved or that needs follow-up.]</li>
-</ul>
-
-<hr style="border: none; border-top: 2px solid #1a73e8; margin: 24px 0;">
-
-<h2 style="color: #1a73e8;">✅ Follow-Up Actions</h2>
-<table style="width: 100%; border-collapse: collapse; margin-bottom: 20px;">
-  <tr style="background: #f8f9fa;">
-    <td style="padding: 8px; border: 1px solid #ddd;">[What we committed to / internal prep]</td>
-    <td style="padding: 8px; border: 1px solid #ddd; width: 90px; text-align: center;">[Owner]</td>
-    <td style="padding: 8px; border: 1px solid #ddd; width: 110px; text-align: center;">🔴 Today</td>
+<h2 style="color: #1a73e8; font-size: 18px; margin: 24px 0 8px;">Next steps</h2>
+<table role="presentation" style="width: 100%; border-collapse: collapse; margin: 0 0 18px;">
+  <tr>
+    <td style="padding: 9px; border: 1px solid #ddd; width: 120px;"><strong>[Owner]</strong></td>
+    <td style="padding: 9px; border: 1px solid #ddd;">[Specific follow-up and stated timing.]</td>
   </tr>
 </table>
 
-<hr style="border: none; border-top: 2px solid #1a73e8; margin: 24px 0;">
-<p>Full transcript and recording available on <a href="[transcript URL]">Fireflies</a>.</p>
-<p>[Short closing line for the team.]</p>
-<p>– [Sender name]</p>
+<p style="margin-top: 22px;">Full transcript and recording: <a href="[transcript URL]">Fireflies</a></p>
+<p>[A brief note about the next conversation or unresolved question.]</p>
+<p>Best,<br>Shawn</p>
 </body></html>
 ```

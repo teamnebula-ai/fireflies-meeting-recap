@@ -10,10 +10,11 @@ The interesting part is the recipient policy. The driver — not the model —
 decides who gets what:
 
 - **Internal meeting** (everyone is on your domain): one recap to all attendees.
-- **External / sales call** (an outside guest is present): **two** emails —
+- **External / sales call** (an outside guest is present): an internal debrief,
+  plus a client-facing recap unless a blocked domain, person, or topic is found:
   1. an **internal debrief** to your team only (the guest never receives it), and
-  2. a **client-facing recap** to **everyone**, written from a separate,
-     guard-railed template that carries no internal notes.
+  2. a **client-facing recap** to your team and allowed outside guests, written
+     from a separate, guard-railed template that carries no internal notes.
 - **Ambiguous** (no attendee emails, an outside-only call, or a fetch failure):
   a draft is held for the owner; nothing is sent automatically.
 
@@ -31,7 +32,7 @@ Fireflies "transcription completed"
                               2. dedupe    permanent ledger (survives restarts)
                               3. fetch     Fireflies GraphQL
                               4. classify  recipients/mode by email domain
-                              5. generate  one-shot LLM CLI → recap HTML body only
+                              5. generate  LLM draft → deterministic HTML cleanup/validation
                               6. send      Composio Gmail (send / draft)
                               7. reconcile search/update/create Linear work
                               8. notify    optional status ping
@@ -171,8 +172,10 @@ All configuration is environment variables (see
 | `LINEAR_API_KEY` / `NEB_LINEAR_API_KEY` | Linear GraphQL access; NEB-prefixed value wins |
 | `RECAP_INTERNAL_DOMAIN` | the domain that counts as "internal" |
 | `RECAP_BLOCKED_DOMAINS` | domains that must never receive an automated recap (comma-separated) |
+| `RECAP_BLOCKED_EXTERNAL_TERMS` | people, projects, and topics that suppress every client-facing recap |
 | `RECAP_EMAIL_ALIASES` | `alias=canonical` pairs for teammates on a second address |
 | `RECAP_OWNER_EMAIL` | fallback inbox for drafts / failures |
+| `RECAP_OWNER_DISPLAY_NAME` | exact signer name enforced after generation; defaults to `Shawn` |
 | `RECAP_NOTIFY_TARGET` | optional status pings (blank to disable) |
 | `RECAP_GEN_BIN` / `RECAP_GEN_MODEL` | the generation CLI and model |
 | `RECAP_WRITING_SPEC` | path to the recap writing guidance |
@@ -180,7 +183,7 @@ All configuration is environment variables (see
 
 ### Recipient safety
 
-Three deterministic (non-LLM) gates run on every send:
+Five deterministic (non-LLM) gates run on every send:
 
 - **Blocked domains.** Addresses at a `RECAP_BLOCKED_DOMAINS` domain are
   stripped from every route, and re-filtered again at the send boundary as a
@@ -189,6 +192,11 @@ Three deterministic (non-LLM) gates run on every send:
   team — but no automated mail is ever addressed to a blocked inbox, and if the
   only guest was blocked, no client recap is sent at all. Use this for clients
   under a no-automation agreement.
+- **Blocked meeting context.** If a blocked domain appears anywhere in the
+  meeting, or `RECAP_BLOCKED_EXTERNAL_TERMS` matches a person, project, contract,
+  or topic in the title, attendees, summary, or transcript, the system suppresses
+  every client-facing recap. The internal debrief still goes to your team. Use
+  full names and specific project labels to avoid broad matches.
 - **Email aliases.** `RECAP_EMAIL_ALIASES` canonicalizes teammates who join
   under a second address (an agency account, a personal calendar) to their
   internal identity, so those meetings classify as internal instead of leaking
@@ -198,6 +206,16 @@ Three deterministic (non-LLM) gates run on every send:
   phrase list (internal debrief, deal health, competitive intel, transcript
   links, ...) after generation; a real run aborts before anything is sent if the
   scan matches, and `--dry` prints a warning.
+- **Owner signature.** Generated HTML passes through a final deterministic
+  rewrite that replaces any model-written sign-off with `Best,<br>Shawn` (or
+  the exact value of `RECAP_OWNER_DISPLAY_NAME`) before draft or delivery.
+- **Email formatting.** The generator strips model chatter and Markdown fences,
+  preserves inline email styles, repairs missing closing container tags, and
+  validates the complete `<html><body>...</body></html>` document. Placeholder
+  text, empty lists or tables, malformed structure, unsafe attributes, and
+  email-incompatible layout trigger a fresh generation attempt instead of
+  reaching Gmail. A separate voice check rejects canned phrases and drafts
+  that do not carry a concrete detail from the meeting.
 
 ## Linear reconciliation
 
@@ -240,6 +258,8 @@ model you want. The internal/sales writing guidance lives in
 [`templates/writing_spec.md`](templates/writing_spec.md) — edit it to match your
 team's voice. The client-facing template is `CLIENT_SPEC` in `run_recap.py`,
 kept separate on purpose so internal framing can't leak into a client email.
+Both prompts ask for a direct, conversational note tied to the actual meeting,
+with brief paragraphs and only the sections that contain useful information.
 
 ## Test a meeting without sending
 
