@@ -119,13 +119,6 @@ class TestSignature(unittest.TestCase):
 
 
 class TestRouting(unittest.TestCase):
-    def setUp(self):
-        self._orig_allowed = run_recap.CLIENT_ALLOWED_DOMAINS
-        run_recap.CLIENT_ALLOWED_DOMAINS = {"rivus.mx"}
-
-    def tearDown(self):
-        run_recap.CLIENT_ALLOWED_DOMAINS = self._orig_allowed
-
     def test_internal_one_send_to_all(self):
         allm = ["a@example.com", "b@example.com"]
         sends = run_recap.route_sends("internal", allm, allm)
@@ -135,32 +128,25 @@ class TestRouting(unittest.TestCase):
 
     def test_sales_two_sends_debrief_internal_client_all(self):
         internal = ["host@example.com"]
-        allm = ["host@example.com", "guest@rivus.mx"]
+        allm = ["host@example.com", "guest@acme.com"]
         sends = run_recap.route_sends("sales", internal, allm)
         kinds = {s["kind"]: s["recipients"] for s in sends}
         self.assertEqual(kinds["sales_debrief"], ["host@example.com"])
-        self.assertEqual(set(kinds["client"]), {"host@example.com", "guest@rivus.mx"})
+        self.assertEqual(set(kinds["client"]), {"host@example.com", "guest@acme.com"})
 
-    def test_non_allowlisted_client_gets_no_recap(self):
+    def test_external_recipients_are_allowed_by_default(self):
         internal = ["host@example.com"]
         allm = ["host@example.com", "guest@acme.com"]
         sends = run_recap.route_sends("sales", internal, allm)
-        self.assertEqual(sends, [{"kind": "sales_debrief", "recipients": internal}])
+        kinds = {s["kind"]: s["recipients"] for s in sends}
+        self.assertEqual(kinds["client"], allm)
 
-    def test_mixed_external_meeting_only_addresses_allowlisted_client(self):
+    def test_mixed_external_meeting_addresses_all_unblocked_guests(self):
         internal = ["host@example.com"]
         allm = internal + ["guest@rivus.mx", "observer@acme.com"]
         sends = run_recap.route_sends("sales", internal, allm)
         kinds = {s["kind"]: s["recipients"] for s in sends}
-        self.assertEqual(kinds["client"], ["host@example.com", "guest@rivus.mx"])
-        self.assertNotIn("observer@acme.com", kinds["client"])
-
-    def test_empty_allowlist_fails_closed_for_every_client(self):
-        run_recap.CLIENT_ALLOWED_DOMAINS = set()
-        internal = ["host@example.com"]
-        allm = internal + ["guest@rivus.mx"]
-        sends = run_recap.route_sends("sales", internal, allm)
-        self.assertEqual(sends, [{"kind": "sales_debrief", "recipients": internal}])
+        self.assertEqual(kinds["client"], allm)
 
     def test_internal_debrief_never_contains_external(self):
         internal = ["host@example.com", "ops@example.com"]
@@ -182,13 +168,10 @@ class TestBlockedDomains(unittest.TestCase):
 
     def setUp(self):
         self._orig = run_recap.BLOCKED_DOMAINS
-        self._orig_allowed = run_recap.CLIENT_ALLOWED_DOMAINS
         run_recap.BLOCKED_DOMAINS = {"lockeddown.com"}
-        run_recap.CLIENT_ALLOWED_DOMAINS = {"lockeddown.com", "acme.com"}
 
     def tearDown(self):
         run_recap.BLOCKED_DOMAINS = self._orig
-        run_recap.CLIENT_ALLOWED_DOMAINS = self._orig_allowed
 
     def test_classification_still_sees_blocked_guest(self):
         # internal + blocked guest is still a sales call -> team gets the debrief
@@ -228,6 +211,56 @@ class TestBlockedDomains(unittest.TestCase):
     def test_is_blocked_recipient_case_insensitive(self):
         self.assertTrue(run_recap.is_blocked_recipient("X@LockedDown.com".lower()))
         self.assertFalse(run_recap.is_blocked_recipient("x@example.com"))
+
+
+class TestBlockedExternalContext(unittest.TestCase):
+    def setUp(self):
+        self._orig_domains = run_recap.BLOCKED_DOMAINS
+        self._orig_terms = run_recap.BLOCKED_EXTERNAL_TERMS
+        run_recap.BLOCKED_DOMAINS = {"rs21.io"}
+        run_recap.BLOCKED_EXTERNAL_TERMS = {
+            "rs21", "research innovations", "brady key", "nmosa", "unmccc"
+        }
+
+    def tearDown(self):
+        run_recap.BLOCKED_DOMAINS = self._orig_domains
+        run_recap.BLOCKED_EXTERNAL_TERMS = self._orig_terms
+
+    def test_rs21_email_blocks_every_client_facing_send(self):
+        transcript = _t(["host@example.com", "brady@rs21.io", "guest@acme.com"])
+        sends = run_recap.apply_external_context_gate(
+            run_recap.route_sends(
+                "sales", ["host@example.com"], run_recap.attendee_emails(transcript)),
+            transcript,
+        )
+        self.assertEqual(
+            sends,
+            [{"kind": "sales_debrief", "recipients": ["host@example.com"]}],
+        )
+
+    def test_known_person_in_attendee_name_blocks_client_send(self):
+        transcript = _t(["host@example.com", "guest@acme.com"])
+        transcript["meeting_attendees"][1]["displayName"] = "Brady Key"
+        self.assertTrue(run_recap.meeting_has_blocked_external_context(transcript))
+
+    def test_rs21_topic_in_title_summary_or_transcript_blocks(self):
+        samples = [
+            {"title": "NMOSA delivery review"},
+            {"summary": {"overview": "Research Innovations partnership update"}},
+            {"sentences": [{"speaker_name": "Shawn", "text": "Next steps for UNMCCC"}]},
+        ]
+        for transcript in samples:
+            with self.subTest(transcript=transcript):
+                self.assertTrue(run_recap.meeting_has_blocked_external_context(transcript))
+
+    def test_term_matching_uses_boundaries(self):
+        self.assertFalse(run_recap.meeting_has_blocked_external_context(
+            {"title": "Opening remarks for product review"}))
+
+    def test_unrelated_external_meeting_remains_sendable(self):
+        transcript = _t(["host@example.com", "guest@acme.com"])
+        transcript["title"] = "Prospect discovery"
+        self.assertFalse(run_recap.meeting_has_blocked_external_context(transcript))
 
 
 class TestEmailAliases(unittest.TestCase):

@@ -92,11 +92,16 @@ def _parse_aliases(raw):
 # guarantee holds even when such a person joins a call about something else.
 BLOCKED_DOMAINS = _parse_domains(os.environ.get("RECAP_BLOCKED_DOMAINS", ""))
 
-# The only external domains allowed to receive a client-facing recap. Empty is
-# deliberately fail-closed: internal debriefs still send, but no outside address
-# receives automated mail until its domain is named here.
-CLIENT_ALLOWED_DOMAINS = _parse_domains(
-    os.environ.get("RECAP_CLIENT_ALLOWED_DOMAINS", ""))
+
+def _parse_terms(raw):
+    return {" ".join(t.strip().lower().split())
+            for t in (raw or "").split(",") if t.strip()}
+
+
+# People, project names, contract labels, and other topics that make a meeting
+# unsuitable for any client-facing recap. Internal recaps remain enabled.
+BLOCKED_EXTERNAL_TERMS = _parse_terms(
+    os.environ.get("RECAP_BLOCKED_EXTERNAL_TERMS", ""))
 
 # Teammates who join meetings under a second address (e.g. an agency account)
 # but are internal. Alias SPECIFIC people, not whole domains — aliasing a domain
@@ -116,7 +121,7 @@ def load_env():
     """Source RECAP_ENV_FILE into os.environ (KEY=VALUE, ignore #/blank)."""
     global GEN_BIN, GEN_MODEL, GEN_TIMEOUT, INTERNAL_DOMAIN, OWNER_EMAIL
     global OWNER_DISPLAY_NAME, NOTIFY_TARGET, WRITING_SPEC, BLOCKED_DOMAINS
-    global CLIENT_ALLOWED_DOMAINS, EMAIL_ALIASES
+    global BLOCKED_EXTERNAL_TERMS, EMAIL_ALIASES
     if not ENV_FILE.exists():
         log(f"note: env file {ENV_FILE} not present (relying on process env)")
     else:
@@ -137,8 +142,8 @@ def load_env():
     NOTIFY_TARGET = os.environ.get("RECAP_NOTIFY_TARGET", NOTIFY_TARGET)
     WRITING_SPEC = Path(os.environ.get("RECAP_WRITING_SPEC", str(WRITING_SPEC)))
     BLOCKED_DOMAINS = _parse_domains(os.environ.get("RECAP_BLOCKED_DOMAINS", ""))
-    CLIENT_ALLOWED_DOMAINS = _parse_domains(
-        os.environ.get("RECAP_CLIENT_ALLOWED_DOMAINS", ""))
+    BLOCKED_EXTERNAL_TERMS = _parse_terms(
+        os.environ.get("RECAP_BLOCKED_EXTERNAL_TERMS", ""))
     EMAIL_ALIASES = _parse_aliases(os.environ.get("RECAP_EMAIL_ALIASES", ""))
 
 
@@ -245,9 +250,24 @@ def is_blocked_recipient(email):
     return domain in BLOCKED_DOMAINS
 
 
-def is_allowed_client_recipient(email):
-    domain = (email.split("@", 1)[1] if "@" in email else "").lower()
-    return domain in CLIENT_ALLOWED_DOMAINS
+def meeting_has_blocked_external_context(transcript):
+    """True when a blocked domain, person, or topic appears anywhere in a meeting."""
+    text = " ".join(json.dumps(transcript or {}, ensure_ascii=False).lower().split())
+    for email in re.findall(r"[a-z0-9._%+\-]+@([a-z0-9.\-]+)", text):
+        if email.rstrip(".") in BLOCKED_DOMAINS:
+            return True
+    for term in BLOCKED_EXTERNAL_TERMS:
+        pattern = rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])"
+        if re.search(pattern, text):
+            return True
+    return False
+
+
+def apply_external_context_gate(sends, transcript):
+    """Suppress every client-facing route when the meeting is blocked."""
+    if not meeting_has_blocked_external_context(transcript):
+        return sends
+    return [send for send in sends if send.get("kind") != "client"]
 
 
 def _norm_name(value):
@@ -320,12 +340,9 @@ def route_sends(mode, internal_recipients, all_emails):
     NEVER contains an external address. The only thing that reaches outside
     guests is the 'client' send, which carries the client-safe HTML.
 
-    External domains must be named in RECAP_CLIENT_ALLOWED_DOMAINS. An empty
-    allowlist sends no client recap. Blocked domains (RECAP_BLOCKED_DOMAINS)
-    are stripped from every route and override the allowlist.
-    Classification upstream still sees the true attendee list — a call with a
-    blocked guest still counts as 'sales', so the team gets the candid debrief —
-    but no recap is ever ADDRESSED to a blocked inbox.
+    Blocked domains (RECAP_BLOCKED_DOMAINS) are stripped from every route.
+    Classification upstream still sees the true attendee list, so a call with a
+    blocked guest still counts as 'sales' and the team gets the candid debrief.
     """
     sendable = lambda emails: [e for e in emails if not is_blocked_recipient(e)]
     if mode == "internal":
@@ -336,8 +353,7 @@ def route_sends(mode, internal_recipients, all_emails):
         debrief = sendable(internal_recipients)
         if debrief:
             sends.append({"kind": "sales_debrief", "recipients": debrief})
-        client = [e for e in sendable(all_emails)
-                  if e.endswith("@" + INTERNAL_DOMAIN) or is_allowed_client_recipient(e)]
+        client = sendable(all_emails)
         # Only send a client recap if a genuine external recipient remains after
         # filtering — a call whose only guest was blocked has no client to recap to.
         if any(not e.endswith("@" + INTERNAL_DOMAIN) for e in client):
@@ -732,7 +748,10 @@ def main():
 
     # ----- internal / sales: build the send plan -------------------------------
     all_emails = attendee_emails(transcript)
-    sends = route_sends(mode, recipients, all_emails)
+    sends = apply_external_context_gate(
+        route_sends(mode, recipients, all_emails), transcript)
+    if mode == "sales" and meeting_has_blocked_external_context(transcript):
+        log(f'client-facing recap blocked by meeting context for "{title}" ({mid})')
 
     # Safety invariant: the internal debrief must never reach an external address.
     external = [e for e in all_emails if not e.endswith("@" + INTERNAL_DOMAIN)]
@@ -788,12 +807,8 @@ def main():
     for s in sends:
         # Belt-and-suspenders: route_sends already strips blocked domains, but
         # Re-filter at the send boundary so no future routing change can address
-        # an automated recap to a blocked or non-allowlisted outside inbox.
-        s["recipients"] = [
-            e for e in s["recipients"]
-            if not is_blocked_recipient(e)
-            and (e.endswith("@" + INTERNAL_DOMAIN) or is_allowed_client_recipient(e))
-        ]
+        # an automated recap to a blocked inbox.
+        s["recipients"] = [e for e in s["recipients"] if not is_blocked_recipient(e)]
         if not s["recipients"]:
             continue
         r = send_email(s["recipients"], s["subject"], s["html"])

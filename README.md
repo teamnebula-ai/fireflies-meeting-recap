@@ -11,7 +11,7 @@ decides who gets what:
 
 - **Internal meeting** (everyone is on your domain): one recap to all attendees.
 - **External / sales call** (an outside guest is present): an internal debrief,
-  plus a client-facing recap only when the guest's domain is explicitly allowed:
+  plus a client-facing recap unless a blocked domain, person, or topic is found:
   1. an **internal debrief** to your team only (the guest never receives it), and
   2. a **client-facing recap** to your team and allowed outside guests, written
      from a separate, guard-railed template that carries no internal notes.
@@ -171,8 +171,8 @@ All configuration is environment variables (see
 | `COMPOSIO_API_KEY` / `COMPOSIO_USER_ID` | Gmail send/draft via Composio |
 | `LINEAR_API_KEY` / `NEB_LINEAR_API_KEY` | Linear GraphQL access; NEB-prefixed value wins |
 | `RECAP_INTERNAL_DOMAIN` | the domain that counts as "internal" |
-| `RECAP_CLIENT_ALLOWED_DOMAINS` | the only external domains allowed to receive a recap; empty blocks all clients |
 | `RECAP_BLOCKED_DOMAINS` | domains that must never receive an automated recap (comma-separated) |
+| `RECAP_BLOCKED_EXTERNAL_TERMS` | people, projects, and topics that suppress every client-facing recap |
 | `RECAP_EMAIL_ALIASES` | `alias=canonical` pairs for teammates on a second address |
 | `RECAP_OWNER_EMAIL` | fallback inbox for drafts / failures |
 | `RECAP_OWNER_DISPLAY_NAME` | exact signer name enforced after generation; defaults to `Shawn` |
@@ -185,12 +185,6 @@ All configuration is environment variables (see
 
 Five deterministic (non-LLM) gates run on every send:
 
-- **Client allowlist.** Outside addresses receive a client-facing recap only
-  when their domain appears in `RECAP_CLIENT_ALLOWED_DOMAINS`. The default is
-  empty, so external delivery fails closed. In a mixed meeting, the client
-  recap includes your internal attendees and only the allowed outside guests.
-  For Rivus-only delivery, set `RECAP_CLIENT_ALLOWED_DOMAINS=rivus.mx`.
-
 - **Blocked domains.** Addresses at a `RECAP_BLOCKED_DOMAINS` domain are
   stripped from every route, and re-filtered again at the send boundary as a
   belt-and-suspenders check. Classification still sees the true attendee list,
@@ -198,6 +192,11 @@ Five deterministic (non-LLM) gates run on every send:
   team — but no automated mail is ever addressed to a blocked inbox, and if the
   only guest was blocked, no client recap is sent at all. Use this for clients
   under a no-automation agreement.
+- **Blocked meeting context.** If a blocked domain appears anywhere in the
+  meeting, or `RECAP_BLOCKED_EXTERNAL_TERMS` matches a person, project, contract,
+  or topic in the title, attendees, summary, or transcript, the system suppresses
+  every client-facing recap. The internal debrief still goes to your team. Use
+  full names and specific project labels to avoid broad matches.
 - **Email aliases.** `RECAP_EMAIL_ALIASES` canonicalizes teammates who join
   under a second address (an agency account, a personal calendar) to their
   internal identity, so those meetings classify as internal instead of leaking
