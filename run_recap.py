@@ -62,6 +62,13 @@ WRITING_SPEC = Path(os.environ.get("RECAP_WRITING_SPEC", str(HERE / "templates" 
 GEN_BIN = os.environ.get("RECAP_GEN_BIN", "hermes")
 GEN_MODEL = os.environ.get("RECAP_GEN_MODEL", "gpt-5")
 GEN_TIMEOUT = int(os.environ.get("RECAP_GEN_TIMEOUT", "600"))
+# Prompt transport to GEN_BIN. Default: argv (`-z <prompt>`), which Linux caps
+# at 128 KiB per argument — a two-hour transcript is ~100 KB before the writing
+# spec and the Linear backlog are added, and the live box died on exactly that
+# with `OSError: [Errno 7] Argument list too long`. RECAP_GEN_STDIN=1 sends
+# `-z -` and the prompt on stdin instead; needs a GEN_BIN that reads `-` from
+# stdin (contrib/hermes-remote does).
+GEN_STDIN = os.environ.get("RECAP_GEN_STDIN", "0") == "1"
 
 # Identity / routing
 INTERNAL_DOMAIN = os.environ.get("RECAP_INTERNAL_DOMAIN", "example.com")
@@ -102,13 +109,18 @@ COMPOSIO_EXEC = "https://backend.composio.dev/api/v3/tools/execute"
 
 
 def log(msg):
-    sys.stderr.write(f"[recap] {msg}\n")
+    # UTC timestamp on every line. The spawn log is the only record of a run
+    # (the receiver detaches run_recap from journald), and a run that dies
+    # between the claim and the first generation line used to leave nothing that
+    # could be placed in time at all.
+    ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    sys.stderr.write(f"[recap {ts}] {msg}\n")
     sys.stderr.flush()
 
 
 def load_env():
     """Source RECAP_ENV_FILE into os.environ (KEY=VALUE, ignore #/blank)."""
-    global GEN_BIN, GEN_MODEL, GEN_TIMEOUT, INTERNAL_DOMAIN, OWNER_EMAIL
+    global GEN_BIN, GEN_MODEL, GEN_TIMEOUT, GEN_STDIN, INTERNAL_DOMAIN, OWNER_EMAIL
     global OWNER_DISPLAY_NAME, NOTIFY_TARGET, WRITING_SPEC, BLOCKED_DOMAINS, EMAIL_ALIASES
     if not ENV_FILE.exists():
         log(f"note: env file {ENV_FILE} not present (relying on process env)")
@@ -124,6 +136,7 @@ def load_env():
     GEN_BIN = os.environ.get("RECAP_GEN_BIN", GEN_BIN)
     GEN_MODEL = os.environ.get("RECAP_GEN_MODEL", GEN_MODEL)
     GEN_TIMEOUT = int(os.environ.get("RECAP_GEN_TIMEOUT", str(GEN_TIMEOUT)))
+    GEN_STDIN = os.environ.get("RECAP_GEN_STDIN", "1" if GEN_STDIN else "0") == "1"
     INTERNAL_DOMAIN = os.environ.get("RECAP_INTERNAL_DOMAIN", INTERNAL_DOMAIN)
     OWNER_EMAIL = os.environ.get("RECAP_OWNER_EMAIL", OWNER_EMAIL)
     OWNER_DISPLAY_NAME = os.environ.get("RECAP_OWNER_DISPLAY_NAME", OWNER_DISPLAY_NAME)
@@ -210,7 +223,23 @@ def fetch_transcript(meeting_id):
         return None, r["_error"]
     t = (r or {}).get("data", {}).get("transcript")
     if not t:
-        return None, f"transcript null (resp: {str(r)[:200]})"
+        # Fireflies answers `object_not_found` both for a deleted transcript and
+        # for one that exists in a workspace this key cannot see. The second is
+        # the one that bites: a webhook registered on another Fireflies account
+        # delivers IDs the key will never resolve, and every recap goes
+        # "ambiguous" with a JSON dump as the reason. Say which account holds
+        # the key so the mismatch is the first thing read, not the last.
+        errs = (r or {}).get("errors") if isinstance(r, dict) else None
+        codes = set()
+        for e in errs or []:
+            if isinstance(e, dict):
+                codes.add(str(e.get("code") or (e.get("extensions") or {}).get("code") or ""))
+        hint = ""
+        if "object_not_found" in codes:
+            hint = (" — the FIREFLIES_API_KEY account cannot see this transcript; the webhook "
+                    "that delivered it may belong to another Fireflies workspace (check the key "
+                    "with `{ user { email } }`)")
+        return None, f"transcript null (resp: {str(r)[:200]}){hint}"
     return t, None
 
 
@@ -424,6 +453,20 @@ def _clean_json(text):
     return payload
 
 
+def gen_argv(prompt):
+    """The GEN_BIN command line for a prompt: `-z <prompt>` or, with
+    RECAP_GEN_STDIN=1, `-z -` with the prompt delivered on stdin."""
+    if GEN_STDIN:
+        return [GEN_BIN, "-m", GEN_MODEL, "-z", "-"]
+    return [GEN_BIN, "-m", GEN_MODEL, "-z", prompt]
+
+
+def _gen_run(prompt, env):
+    """One GEN_BIN invocation. Raises subprocess.TimeoutExpired like subprocess.run."""
+    return subprocess.run(gen_argv(prompt), input=(prompt if GEN_STDIN else None),
+                          capture_output=True, text=True, timeout=GEN_TIMEOUT, env=env)
+
+
 def generate_json(prompt):
     """Run the configured model for structured analysis."""
     if not (os.path.exists(GEN_BIN) or _which(GEN_BIN)):
@@ -434,9 +477,7 @@ def generate_json(prompt):
     for attempt in (1, 2):
         log(f"gen structured attempt {attempt} model={GEN_MODEL}")
         try:
-            proc = subprocess.run([GEN_BIN, "-m", GEN_MODEL, "-z", prompt],
-                                  capture_output=True, text=True,
-                                  timeout=GEN_TIMEOUT, env=sub_env)
+            proc = _gen_run(prompt, sub_env)
         except subprocess.TimeoutExpired:
             last = f"timeout {GEN_TIMEOUT}s"
             continue
@@ -526,9 +567,7 @@ def generate_html(fmt, transcript):
         log(f"gen one-shot attempt {attempt} model={GEN_MODEL} fmt={fmt}")
         t0 = time.monotonic()
         try:
-            proc = subprocess.run([GEN_BIN, "-m", GEN_MODEL, "-z", prompt],
-                                  capture_output=True, text=True,
-                                  timeout=GEN_TIMEOUT, env=sub_env)
+            proc = _gen_run(prompt, sub_env)
         except subprocess.TimeoutExpired:
             last = f"timeout {GEN_TIMEOUT}s"
             continue
@@ -555,9 +594,27 @@ def _composio(tool, arguments):
     uid = os.environ.get("COMPOSIO_USER_ID")
     if not (key and uid):
         return {"_error": "COMPOSIO_API_KEY/USER_ID missing"}
-    return _req("POST", f"{COMPOSIO_EXEC}/{tool}",
-                {"x-api-key": key, "Content-Type": "application/json"},
-                {"user_id": uid, "arguments": arguments}, timeout=90)
+    body = {"user_id": uid, "arguments": arguments}
+    # Name the mailbox. A Composio entity can hold several Gmail connections and
+    # the default pick is silent; the REST execute route honours a top-level
+    # connected_account_id, so pass it whenever the deployment sets one.
+    ca = (os.environ.get("COMPOSIO_CONNECTED_ACCOUNT_ID") or "").strip()
+    if ca:
+        body["connected_account_id"] = ca
+    r = _req("POST", f"{COMPOSIO_EXEC}/{tool}",
+             {"x-api-key": key, "Content-Type": "application/json"}, body, timeout=90)
+    if isinstance(r, dict) and r.get("_error"):
+        # Loud in the spawn log. A dead key answered 401 on every send and every
+        # fallback draft for two weeks (2026-08-21..09-03) and the log never said so.
+        log(f"Composio {tool} failed: {str(r['_error'])[:300]}")
+        return r
+    if isinstance(r, dict) and r.get("successful") is False:
+        # HTTP 200 with a tool-level failure. Counting this as delivered is how a
+        # recap gets reported "✓ sent" with nothing in anyone's inbox.
+        err = f"Composio {tool} not successful: {str(r.get('error'))[:300]}"
+        log(err)
+        return {"_error": err, "raw": r}
+    return r
 
 
 def send_email(to_list, subject, html):

@@ -168,6 +168,7 @@ All configuration is environment variables (see
 |---|---|
 | `FIREFLIES_API_KEY` | Fireflies GraphQL auth |
 | `COMPOSIO_API_KEY` / `COMPOSIO_USER_ID` | Gmail send/draft via Composio |
+| `COMPOSIO_CONNECTED_ACCOUNT_ID` | optional; names the exact Gmail connection (`ca_…`) so an entity with several mailboxes never picks one silently |
 | `LINEAR_API_KEY` / `NEB_LINEAR_API_KEY` | Linear GraphQL access; NEB-prefixed value wins |
 | `RECAP_INTERNAL_DOMAIN` | the domain that counts as "internal" |
 | `RECAP_BLOCKED_DOMAINS` | domains that must never receive an automated recap (comma-separated) |
@@ -175,8 +176,37 @@ All configuration is environment variables (see
 | `RECAP_OWNER_EMAIL` | fallback inbox for drafts / failures |
 | `RECAP_NOTIFY_TARGET` | optional status pings (blank to disable) |
 | `RECAP_GEN_BIN` / `RECAP_GEN_MODEL` | the generation CLI and model |
+| `RECAP_GEN_STDIN` | `1` sends the prompt to the CLI on stdin (`-z -`) instead of argv; see "Bring your own LLM" |
 | `RECAP_WRITING_SPEC` | path to the recap writing guidance |
 | `RECAP_LINEAR_ENABLED` | Linear reconciliation kill switch; defaults to enabled |
+
+### Credentials have to belong to the right accounts
+
+Two outages, both silent from the outside, both came from a credential that was
+valid for the wrong thing:
+
+- **The Composio key must be live and the mailbox must be named.** From
+  2026-08-21 to 2026-09-03 the live box carried a key from a Composio org that
+  had been retired. Every `GMAIL_SEND_EMAIL` answered 401, so did every fallback
+  draft, and the spawn log never said so, because a failed send only surfaced in
+  the status ping. `_composio` now logs every failure, treats an HTTP 200 with
+  `successful: false` as a failure instead of a delivered email, and passes
+  `COMPOSIO_CONNECTED_ACCOUNT_ID` when set so an entity with several Gmail
+  connections cannot pick one silently. Verify a deployment with
+  `GMAIL_GET_PROFILE` through the same key and ids before trusting a send.
+- **The Fireflies key must belong to the workspace that owns the webhook.**
+  Fireflies answers `object_not_found` for a transcript in a workspace the key
+  cannot see, which is indistinguishable from a deleted transcript. On
+  2026-09-03 the webhook began delivering IDs from a second workspace; the
+  driver fetched with the first workspace's key, every meeting went "ambiguous",
+  and the reason was a 200-character JSON dump. `fetch_transcript` now names the
+  mismatch in the reason. Check which account a key is with
+  `{ user { email } }` against the GraphQL API, and register the webhook in that
+  same account.
+
+Every spawn-log line carries a UTC timestamp (`[recap 2026-09-03T17:50:00Z] …`,
+and the receiver's `===== … spawn …` header) so a run that produced nothing can
+still be placed in time.
 
 ### Recipient safety
 
@@ -236,7 +266,22 @@ never calls an update or create tool.
 
 Generation is a pluggable CLI invoked as `<bin> -m <model> -z "<prompt>"` that
 prints the email HTML to stdout. Point `RECAP_GEN_BIN` at any wrapper around the
-model you want. The internal/sales writing guidance lives in
+model you want.
+
+**Long meetings need the stdin transport.** Linux caps a single argv element at
+128 KiB. A two-hour transcript is about 100 KB before the writing spec is added,
+and the Linear step sends the team's open backlog on top of that; the live box
+died on exactly this path with `OSError: [Errno 7] Argument list too long`. Set
+`RECAP_GEN_STDIN=1` and the driver calls `<bin> -m <model> -z -` with the prompt
+on stdin, which has no ceiling. The CLI has to read `-` from stdin for that to
+work. [`contrib/hermes-remote`](contrib/hermes-remote) does: it is the wrapper
+the live box runs, forwarding the prompt to an HTTP generate endpoint
+(`HERMES_LLM_URL`, bearer `HERMES_LLM_TOKEN`) so one machine holds the model
+credential for the fleet. Its `send` verb carries the status pings. Note that a
+shim behind that URL which hands the prompt to a CLI on argv has the same
+128 KiB cliff on its own side.
+
+The internal/sales writing guidance lives in
 [`templates/writing_spec.md`](templates/writing_spec.md) — edit it to match your
 team's voice. The client-facing template is `CLIENT_SPEC` in `run_recap.py`,
 kept separate on purpose so internal framing can't leak into a client email.
