@@ -119,6 +119,13 @@ class TestSignature(unittest.TestCase):
 
 
 class TestRouting(unittest.TestCase):
+    def setUp(self):
+        self._orig_allowed = run_recap.CLIENT_ALLOWED_DOMAINS
+        run_recap.CLIENT_ALLOWED_DOMAINS = {"rivus.mx"}
+
+    def tearDown(self):
+        run_recap.CLIENT_ALLOWED_DOMAINS = self._orig_allowed
+
     def test_internal_one_send_to_all(self):
         allm = ["a@example.com", "b@example.com"]
         sends = run_recap.route_sends("internal", allm, allm)
@@ -128,11 +135,32 @@ class TestRouting(unittest.TestCase):
 
     def test_sales_two_sends_debrief_internal_client_all(self):
         internal = ["host@example.com"]
-        allm = ["host@example.com", "guest@acme.com"]
+        allm = ["host@example.com", "guest@rivus.mx"]
         sends = run_recap.route_sends("sales", internal, allm)
         kinds = {s["kind"]: s["recipients"] for s in sends}
         self.assertEqual(kinds["sales_debrief"], ["host@example.com"])
-        self.assertEqual(set(kinds["client"]), {"host@example.com", "guest@acme.com"})
+        self.assertEqual(set(kinds["client"]), {"host@example.com", "guest@rivus.mx"})
+
+    def test_non_allowlisted_client_gets_no_recap(self):
+        internal = ["host@example.com"]
+        allm = ["host@example.com", "guest@acme.com"]
+        sends = run_recap.route_sends("sales", internal, allm)
+        self.assertEqual(sends, [{"kind": "sales_debrief", "recipients": internal}])
+
+    def test_mixed_external_meeting_only_addresses_allowlisted_client(self):
+        internal = ["host@example.com"]
+        allm = internal + ["guest@rivus.mx", "observer@acme.com"]
+        sends = run_recap.route_sends("sales", internal, allm)
+        kinds = {s["kind"]: s["recipients"] for s in sends}
+        self.assertEqual(kinds["client"], ["host@example.com", "guest@rivus.mx"])
+        self.assertNotIn("observer@acme.com", kinds["client"])
+
+    def test_empty_allowlist_fails_closed_for_every_client(self):
+        run_recap.CLIENT_ALLOWED_DOMAINS = set()
+        internal = ["host@example.com"]
+        allm = internal + ["guest@rivus.mx"]
+        sends = run_recap.route_sends("sales", internal, allm)
+        self.assertEqual(sends, [{"kind": "sales_debrief", "recipients": internal}])
 
     def test_internal_debrief_never_contains_external(self):
         internal = ["host@example.com", "ops@example.com"]
@@ -154,10 +182,13 @@ class TestBlockedDomains(unittest.TestCase):
 
     def setUp(self):
         self._orig = run_recap.BLOCKED_DOMAINS
+        self._orig_allowed = run_recap.CLIENT_ALLOWED_DOMAINS
         run_recap.BLOCKED_DOMAINS = {"lockeddown.com"}
+        run_recap.CLIENT_ALLOWED_DOMAINS = {"lockeddown.com", "acme.com"}
 
     def tearDown(self):
         run_recap.BLOCKED_DOMAINS = self._orig
+        run_recap.CLIENT_ALLOWED_DOMAINS = self._orig_allowed
 
     def test_classification_still_sees_blocked_guest(self):
         # internal + blocked guest is still a sales call -> team gets the debrief

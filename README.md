@@ -10,7 +10,8 @@ The interesting part is the recipient policy. The driver — not the model —
 decides who gets what:
 
 - **Internal meeting** (everyone is on your domain): one recap to all attendees.
-- **External / sales call** (an outside guest is present): **two** emails —
+- **External / sales call** (an outside guest is present): an internal debrief,
+  plus a client-facing recap only when the guest's domain is explicitly allowed —
   1. an **internal debrief** to your team only (the guest never receives it), and
   2. a **client-facing recap** to **everyone**, written from a separate,
      guard-railed template that carries no internal notes.
@@ -170,9 +171,11 @@ All configuration is environment variables (see
 | `COMPOSIO_API_KEY` / `COMPOSIO_USER_ID` | Gmail send/draft via Composio |
 | `LINEAR_API_KEY` / `NEB_LINEAR_API_KEY` | Linear GraphQL access; NEB-prefixed value wins |
 | `RECAP_INTERNAL_DOMAIN` | the domain that counts as "internal" |
+| `RECAP_CLIENT_ALLOWED_DOMAINS` | the only external domains allowed to receive a recap; empty blocks all clients |
 | `RECAP_BLOCKED_DOMAINS` | domains that must never receive an automated recap (comma-separated) |
 | `RECAP_EMAIL_ALIASES` | `alias=canonical` pairs for teammates on a second address |
 | `RECAP_OWNER_EMAIL` | fallback inbox for drafts / failures |
+| `RECAP_OWNER_DISPLAY_NAME` | exact signer name enforced after generation; defaults to `Shawn` |
 | `RECAP_NOTIFY_TARGET` | optional status pings (blank to disable) |
 | `RECAP_GEN_BIN` / `RECAP_GEN_MODEL` | the generation CLI and model |
 | `RECAP_WRITING_SPEC` | path to the recap writing guidance |
@@ -180,7 +183,13 @@ All configuration is environment variables (see
 
 ### Recipient safety
 
-Three deterministic (non-LLM) gates run on every send:
+Four deterministic (non-LLM) gates run on every send:
+
+- **Client allowlist.** Outside addresses receive a client-facing recap only
+  when their domain appears in `RECAP_CLIENT_ALLOWED_DOMAINS`. The default is
+  empty, so external delivery fails closed. In a mixed meeting, the client
+  recap includes your internal attendees and only the allowed outside guests.
+  For Rivus-only delivery, set `RECAP_CLIENT_ALLOWED_DOMAINS=rivus.mx`.
 
 - **Blocked domains.** Addresses at a `RECAP_BLOCKED_DOMAINS` domain are
   stripped from every route, and re-filtered again at the send boundary as a
@@ -198,6 +207,9 @@ Three deterministic (non-LLM) gates run on every send:
   phrase list (internal debrief, deal health, competitive intel, transcript
   links, ...) after generation; a real run aborts before anything is sent if the
   scan matches, and `--dry` prints a warning.
+- **Owner signature.** Generated HTML passes through a final deterministic
+  rewrite that replaces any model-written sign-off with `Best,<br>Shawn` (or
+  the exact value of `RECAP_OWNER_DISPLAY_NAME`) before draft or delivery.
 
 ## Linear reconciliation
 
