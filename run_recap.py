@@ -19,9 +19,10 @@ candidate IDs, transcript evidence, workspace relationships, and writes.
 
 Recipient policy:
   - Internal meeting (all attendees @RECAP_INTERNAL_DOMAIN) → one recap to all attendees.
-  - External/sales (>=1 outside attendee) → TWO emails:
+  - External/sales (>=1 outside attendee) → TWO artifacts:
       * internal debrief  → internal attendees ONLY (never the outside guest)
-      * client recap      → ALL participants, using a separate client-safe template
+      * client recap      → Gmail draft addressed to ALL participants, using a
+                            separate client-safe template; never auto-sent
   - If the recap owner did not personally join the meeting (based on Fireflies
     meeting_attendance), skip all recap sends/drafts.
   - Ambiguous (no emails, or outside guests but zero internal recipient, or fetch
@@ -324,16 +325,17 @@ def classify(transcript):
 
 
 def route_sends(mode, internal_recipients, all_emails):
-    """Pure recipient routing. Returns a list of {kind, recipients} send descriptors.
+    """Pure recipient routing. Returns a list of delivery descriptors.
 
     kind:
       'internal'      -> internal-meeting recap, to all (internal) attendees
       'sales_debrief' -> internal debrief (summary/next-steps), INTERNAL ONLY
-      'client'        -> client-facing recap, to ALL participants incl. the guest
+      'client'        -> client-facing draft, addressed to ALL participants
 
     Safety invariant (enforced here, asserted by tests): a 'sales_debrief' send
     NEVER contains an external address. The only thing that reaches outside
-    guests is the 'client' send, which carries the client-safe HTML.
+    guests is the 'client' draft, which carries the client-safe HTML and stays
+    in the owner's Gmail account until a person sends it.
 
     Blocked domains (RECAP_BLOCKED_DOMAINS) are stripped from every route.
     Classification upstream still sees the true attendee list — a call with a
@@ -350,7 +352,7 @@ def route_sends(mode, internal_recipients, all_emails):
         if debrief:
             sends.append({"kind": "sales_debrief", "recipients": debrief})
         client = sendable(all_emails)
-        # Only send a client recap if a genuine external recipient remains after
+        # Only draft a client recap if a genuine external recipient remains after
         # filtering — a call whose only guest was blocked has no client to recap to.
         if any(not e.endswith("@" + INTERNAL_DOMAIN) for e in client):
             sends.append({"kind": "client", "recipients": client})
@@ -626,9 +628,20 @@ def send_email(to_list, subject, html):
 
 
 def create_draft(to, subject, html):
-    return _composio("GMAIL_CREATE_EMAIL_DRAFT",
-                     {"recipient_email": to, "subject": subject,
-                      "body": html, "is_html": True})
+    to_list = [to] if isinstance(to, str) else list(to)
+    if not to_list:
+        return {"_error": "draft requires at least one recipient"}
+    args = {"recipient_email": to_list[0], "subject": subject,
+            "body": html, "is_html": True}
+    if len(to_list) > 1:
+        args["extra_recipients"] = to_list[1:]
+    return _composio("GMAIL_CREATE_EMAIL_DRAFT", args)
+
+
+def deliver_recap(descriptor):
+    """Send internal mail; hold every client-facing recap as a Gmail draft."""
+    delivery = create_draft if descriptor["kind"] == "client" else send_email
+    return delivery(descriptor["recipients"], descriptor["subject"], descriptor["html"])
 
 
 def notify(msg):
@@ -808,7 +821,7 @@ def main():
             bad = client_safety_violation(s["html"])
             if bad and not args.dry:
                 sys.exit(f"ERROR: client recap failed deterministic content-safety "
-                         f"scan (matched {bad!r}) — nothing sent")
+                         f"scan (matched {bad!r}) — no draft created")
             if bad:
                 print(f"--- WARNING: client recap failed content-safety scan "
                       f"(matched {bad!r}) — a real run would abort")
@@ -816,14 +829,15 @@ def main():
     if args.dry:
         print(f"--- MODE={mode} FMT={fmt} REASON={reason}")
         for s in sends:
-            print(f"--- SEND kind={s['kind']} ({_KIND_LABEL[s['kind']]}) "
+            action = "DRAFT" if s["kind"] == "client" else "SEND"
+            print(f"--- {action} kind={s['kind']} ({_KIND_LABEL[s['kind']]}) "
                   f"RECIPIENTS={s['recipients']}")
             print(f"    SUBJECT: {s['subject']}")
             print(s["html"])
         print_linear_dry_run(reconcile_linear(transcript, dry=True))
         return
 
-    # ----- send each descriptor; fail-safe to an owner draft on any error ------
+    # ----- deliver internal mail; hold client-facing mail as drafts ------------
     results = []
     for s in sends:
         # Belt-and-suspenders: route_sends already strips blocked domains, but
@@ -832,21 +846,27 @@ def main():
         s["recipients"] = [e for e in s["recipients"] if not is_blocked_recipient(e)]
         if not s["recipients"]:
             continue
-        r = send_email(s["recipients"], s["subject"], s["html"])
+        r = deliver_recap(s)
         ok = not (isinstance(r, dict) and r.get("_error"))
         results.append((s, ok, r))
-        if not ok and OWNER_EMAIL:
+        if not ok and s["kind"] != "client" and OWNER_EMAIL:
             create_draft(OWNER_EMAIL, s["subject"], s["html"])
 
-    # Ticket reconciliation happens after email delivery and is best effort. A
-    # Linear outage or model failure can never suppress a recap email.
+    # Ticket reconciliation happens after email delivery or draft creation and
+    # is best effort. A Linear outage cannot suppress either artifact.
     linear_result = reconcile_linear(transcript)
     ledger_add(mid)  # claim already prevents re-fire; never re-run (would double-send the parts that worked)
     lines = []
     for s, ok, r in results:
         label = _KIND_LABEL[s["kind"]]
-        lines.append(f"✓ {label} → {', '.join(s['recipients'])}" if ok
-                     else f"✗ {label} FAILED (held a draft): {r}")
+        if ok and s["kind"] == "client":
+            lines.append(f"✓ {label} drafted → {', '.join(s['recipients'])}")
+        elif ok:
+            lines.append(f"✓ {label} sent → {', '.join(s['recipients'])}")
+        elif s["kind"] == "client":
+            lines.append(f"✗ {label} FAILED to draft: {r}")
+        else:
+            lines.append(f"✗ {label} FAILED (held an owner draft): {r}")
     lines.append(linear_recap.summarize(linear_result))
     notify(f"Recap for \"{title}\" ({mode}):\n" + "\n".join(lines))
 

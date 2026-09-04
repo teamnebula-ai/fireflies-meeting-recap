@@ -5,7 +5,7 @@ Run:  python3 -m unittest test_run_recap -v
 
 Covers the two things that must never regress:
   1. Recipient routing — the internal debrief NEVER reaches an external address;
-     the client recap goes to everyone.
+     the client draft is addressed to everyone but is not sent.
   2. Atomic claim() — duplicate Fireflies events for one meeting can't both
      proceed (the bug that sent 2 emails).
 
@@ -19,6 +19,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import run_recap
 
@@ -149,6 +150,57 @@ class TestRouting(unittest.TestCase):
         self.assertEqual(run_recap.route_sends("ambiguous", [], ["guest@acme.com"]), [])
 
 
+class TestDelivery(unittest.TestCase):
+    """Client-facing recaps stop in Gmail drafts; internal mail still sends."""
+
+    def test_client_recap_creates_one_addressed_draft_without_sending(self):
+        descriptor = {
+            "kind": "client",
+            "recipients": ["host@example.com", "guest@acme.com"],
+            "subject": "Recap",
+            "html": "<html><body><p>Thanks.</p></body></html>",
+        }
+        with patch.object(run_recap, "create_draft", return_value={"id": "draft-1"}) as draft, \
+             patch.object(run_recap, "send_email") as send:
+            result = run_recap.deliver_recap(descriptor)
+
+        self.assertEqual(result, {"id": "draft-1"})
+        draft.assert_called_once_with(
+            ["host@example.com", "guest@acme.com"], "Recap", descriptor["html"])
+        send.assert_not_called()
+
+    def test_internal_recap_still_sends(self):
+        descriptor = {
+            "kind": "internal",
+            "recipients": ["host@example.com"],
+            "subject": "Recap",
+            "html": "<html><body><p>Internal.</p></body></html>",
+        }
+        with patch.object(run_recap, "create_draft") as draft, \
+             patch.object(run_recap, "send_email", return_value={"id": "message-1"}) as send:
+            result = run_recap.deliver_recap(descriptor)
+
+        self.assertEqual(result, {"id": "message-1"})
+        send.assert_called_once_with(["host@example.com"], "Recap", descriptor["html"])
+        draft.assert_not_called()
+
+    def test_multi_recipient_draft_addresses_every_attendee(self):
+        with patch.object(run_recap, "_composio", return_value={"id": "draft-1"}) as composio:
+            run_recap.create_draft(
+                ["host@example.com", "guest@acme.com"],
+                "Recap",
+                "<html><body><p>Thanks.</p></body></html>",
+            )
+
+        composio.assert_called_once_with("GMAIL_CREATE_EMAIL_DRAFT", {
+            "recipient_email": "host@example.com",
+            "extra_recipients": ["guest@acme.com"],
+            "subject": "Recap",
+            "body": "<html><body><p>Thanks.</p></body></html>",
+            "is_html": True,
+        })
+
+
 class TestBlockedDomains(unittest.TestCase):
     """RECAP_BLOCKED_DOMAINS: no automated recap may be ADDRESSED to a blocked
     inbox, while classification still sees the true attendee list."""
@@ -174,7 +226,7 @@ class TestBlockedDomains(unittest.TestCase):
         for s in sends:
             self.assertNotIn("guest@lockeddown.com", s["recipients"],
                              f"{s['kind']} addressed a blocked inbox")
-        # genuine external guest still gets the client recap
+        # A genuine external guest remains addressed on the client draft.
         kinds = {s["kind"]: s["recipients"] for s in sends}
         self.assertIn("lee@acme.com", kinds["client"])
 

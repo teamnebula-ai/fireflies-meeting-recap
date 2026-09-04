@@ -1,24 +1,24 @@
 # fireflies-meeting-recap
 
-Turn a finished [Fireflies](https://fireflies.ai) meeting into a recap email,
-automatically. When Fireflies finishes transcribing, a webhook fires a small
-deterministic Python driver that fetches the transcript, decides recipients by
-email domain, writes the recap with an LLM, sends it through Gmail, and
-reconciles explicit meeting work with Linear.
+Turn a finished [Fireflies](https://fireflies.ai) meeting into a recap email.
+When Fireflies finishes transcribing, a webhook starts a deterministic Python
+driver. The driver fetches the transcript, decides recipients by email domain,
+writes the recap with an LLM, delivers internal mail through Gmail, creates
+client drafts for review, and reconciles explicit meeting work with Linear.
 
 The interesting part is the recipient policy. The driver — not the model —
 decides who gets what:
 
 - **Internal meeting** (everyone is on your domain): one recap to all attendees.
-- **External / sales call** (an outside guest is present): **two** emails —
-  1. an **internal debrief** to your team only (the guest never receives it), and
-  2. a **client-facing recap** to **everyone**, written from a separate,
-     guard-railed template that carries no internal notes.
+- **External / sales call** (an outside guest is present): the driver sends an
+  **internal debrief** to your team and creates a **client-facing Gmail draft**
+  addressed to everyone on the call. A person reviews and sends the client
+  draft. Its separate template carries no internal notes.
 - **Ambiguous** (no attendee emails, an outside-only call, or a fetch failure):
   a draft is held for the owner; nothing is sent automatically.
 
-A hard assertion before every send guarantees the internal debrief can never
-reach an external address.
+A hard assertion before every send keeps the internal debrief inside Team
+Nebula. The client path never invokes the send operation.
 
 ## Flow
 
@@ -32,7 +32,7 @@ Fireflies "transcription completed"
                               3. fetch     Fireflies GraphQL
                               4. classify  recipients/mode by email domain
                               5. generate  one-shot LLM CLI → recap HTML body only
-                              6. send      Composio Gmail (send / draft)
+                              6. deliver   send internal mail / draft client mail
                               7. reconcile search/update/create Linear work
                               8. notify    optional status ping
 ```
@@ -217,7 +217,7 @@ Three deterministic (non-LLM) gates run on every send:
   belt-and-suspenders check. Classification still sees the true attendee list,
   so a call with a blocked guest still produces the internal debrief for your
   team — but no automated mail is ever addressed to a blocked inbox, and if the
-  only guest was blocked, no client recap is sent at all. Use this for clients
+  only guest was blocked, no client draft is created. Use this for clients
   under a no-automation agreement.
 - **Email aliases.** `RECAP_EMAIL_ALIASES` canonicalizes teammates who join
   under a second address (an agency account, a personal calendar) to their
