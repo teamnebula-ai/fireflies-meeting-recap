@@ -13,6 +13,7 @@ reverse proxy / tunnel (e.g. Tailscale Funnel, Cloudflare, nginx) with TLS.
 import json
 import os
 import subprocess
+import time
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -34,6 +35,14 @@ def should_process_event(event):
 def log(msg):
     sys.stderr.write(f"[recap-receiver] {msg}\n")
     sys.stderr.flush()
+
+
+def spawn_header(mid, event, now=None):
+    """The line that opens a run in the spawn log. Timestamped in UTC: the run
+    itself is detached from journald, so this line and run_recap's own log
+    lines are the only record of when anything happened."""
+    ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
+    return f"\n===== {ts} spawn meeting-id={mid} event={event} =====\n"
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -74,7 +83,7 @@ class Handler(BaseHTTPRequestHandler):
 
         SPAWN_LOG.parent.mkdir(parents=True, exist_ok=True)
         fh = open(SPAWN_LOG, "a")
-        fh.write(f"\n===== spawn meeting-id={mid} event={event} =====\n")
+        fh.write(spawn_header(mid, event))
         fh.flush()
         subprocess.Popen(
             [sys.executable, str(RUN_RECAP), "--meeting-id", mid, "--event", event],

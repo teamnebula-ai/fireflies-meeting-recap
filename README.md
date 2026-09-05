@@ -1,24 +1,24 @@
 # fireflies-meeting-recap
 
-Turn a finished [Fireflies](https://fireflies.ai) meeting into a recap email,
-automatically. When Fireflies finishes transcribing, a webhook fires a small
-deterministic Python driver that fetches the transcript, decides recipients by
-email domain, writes the recap with an LLM, sends it through Gmail, and
-reconciles explicit meeting work with Linear.
+Turn a finished [Fireflies](https://fireflies.ai) meeting into a recap email.
+When Fireflies finishes transcribing, a webhook starts a deterministic Python
+driver. The driver fetches the transcript, decides recipients by email domain,
+writes the recap with an LLM, delivers internal mail through Gmail, creates
+client drafts for review, and reconciles explicit meeting work with Linear.
 
 The interesting part is the recipient policy. The driver — not the model —
 decides who gets what:
 
 - **Internal meeting** (everyone is on your domain): one recap to all attendees.
-- **External / sales call** (an outside guest is present): **two** emails —
-  1. an **internal debrief** to your team only (the guest never receives it), and
-  2. a **client-facing recap** to **everyone**, written from a separate,
-     guard-railed template that carries no internal notes.
+- **External / sales call** (an outside guest is present): the driver sends an
+  **internal debrief** to your team and creates a **client-facing Gmail draft**
+  addressed to everyone on the call. A person reviews and sends the client
+  draft. Its separate template carries no internal notes.
 - **Ambiguous** (no attendee emails, an outside-only call, or a fetch failure):
   a draft is held for the owner; nothing is sent automatically.
 
-A hard assertion before every send guarantees the internal debrief can never
-reach an external address.
+A hard assertion before every send keeps the internal debrief inside Team
+Nebula. The client path never invokes the send operation.
 
 ## Flow
 
@@ -32,7 +32,7 @@ Fireflies "transcription completed"
                               3. fetch     Fireflies GraphQL
                               4. classify  recipients/mode by email domain
                               5. generate  one-shot LLM CLI → recap HTML body only
-                              6. send      Composio Gmail (send / draft)
+                              6. deliver   send internal mail / draft client mail
                               7. reconcile search/update/create Linear work
                               8. notify    optional status ping
 ```
@@ -168,6 +168,7 @@ All configuration is environment variables (see
 |---|---|
 | `FIREFLIES_API_KEY` | Fireflies GraphQL auth |
 | `COMPOSIO_API_KEY` / `COMPOSIO_USER_ID` | Gmail send/draft via Composio |
+| `COMPOSIO_CONNECTED_ACCOUNT_ID` | optional; names the exact Gmail connection (`ca_…`) so an entity with several mailboxes never picks one silently |
 | `LINEAR_API_KEY` / `NEB_LINEAR_API_KEY` | Linear GraphQL access; NEB-prefixed value wins |
 | `RECAP_INTERNAL_DOMAIN` | the domain that counts as "internal" |
 | `RECAP_BLOCKED_DOMAINS` | domains that must never receive an automated recap (comma-separated) |
@@ -175,8 +176,37 @@ All configuration is environment variables (see
 | `RECAP_OWNER_EMAIL` | fallback inbox for drafts / failures |
 | `RECAP_NOTIFY_TARGET` | optional status pings (blank to disable) |
 | `RECAP_GEN_BIN` / `RECAP_GEN_MODEL` | the generation CLI and model |
+| `RECAP_GEN_STDIN` | `1` sends the prompt to the CLI on stdin (`-z -`) instead of argv; see "Bring your own LLM" |
 | `RECAP_WRITING_SPEC` | path to the recap writing guidance |
 | `RECAP_LINEAR_ENABLED` | Linear reconciliation kill switch; defaults to enabled |
+
+### Credentials have to belong to the right accounts
+
+Two outages, both silent from the outside, both came from a credential that was
+valid for the wrong thing:
+
+- **The Composio key must be live and the mailbox must be named.** From
+  2026-08-21 to 2026-09-03 the live box carried a key from a Composio org that
+  had been retired. Every `GMAIL_SEND_EMAIL` answered 401, so did every fallback
+  draft, and the spawn log never said so, because a failed send only surfaced in
+  the status ping. `_composio` now logs every failure, treats an HTTP 200 with
+  `successful: false` as a failure instead of a delivered email, and passes
+  `COMPOSIO_CONNECTED_ACCOUNT_ID` when set so an entity with several Gmail
+  connections cannot pick one silently. Verify a deployment with
+  `GMAIL_GET_PROFILE` through the same key and ids before trusting a send.
+- **The Fireflies key must belong to the workspace that owns the webhook.**
+  Fireflies answers `object_not_found` for a transcript in a workspace the key
+  cannot see, which is indistinguishable from a deleted transcript. On
+  2026-09-03 the webhook began delivering IDs from a second workspace; the
+  driver fetched with the first workspace's key, every meeting went "ambiguous",
+  and the reason was a 200-character JSON dump. `fetch_transcript` now names the
+  mismatch in the reason. Check which account a key is with
+  `{ user { email } }` against the GraphQL API, and register the webhook in that
+  same account.
+
+Every spawn-log line carries a UTC timestamp (`[recap 2026-09-03T17:50:00Z] …`,
+and the receiver's `===== … spawn …` header) so a run that produced nothing can
+still be placed in time.
 
 ### Recipient safety
 
@@ -187,7 +217,7 @@ Three deterministic (non-LLM) gates run on every send:
   belt-and-suspenders check. Classification still sees the true attendee list,
   so a call with a blocked guest still produces the internal debrief for your
   team — but no automated mail is ever addressed to a blocked inbox, and if the
-  only guest was blocked, no client recap is sent at all. Use this for clients
+  only guest was blocked, no client draft is created. Use this for clients
   under a no-automation agreement.
 - **Email aliases.** `RECAP_EMAIL_ALIASES` canonicalizes teammates who join
   under a second address (an agency account, a personal calendar) to their
@@ -236,7 +266,22 @@ never calls an update or create tool.
 
 Generation is a pluggable CLI invoked as `<bin> -m <model> -z "<prompt>"` that
 prints the email HTML to stdout. Point `RECAP_GEN_BIN` at any wrapper around the
-model you want. The internal/sales writing guidance lives in
+model you want.
+
+**Long meetings need the stdin transport.** Linux caps a single argv element at
+128 KiB. A two-hour transcript is about 100 KB before the writing spec is added,
+and the Linear step sends the team's open backlog on top of that; the live box
+died on exactly this path with `OSError: [Errno 7] Argument list too long`. Set
+`RECAP_GEN_STDIN=1` and the driver calls `<bin> -m <model> -z -` with the prompt
+on stdin, which has no ceiling. The CLI has to read `-` from stdin for that to
+work. [`contrib/hermes-remote`](contrib/hermes-remote) does: it is the wrapper
+the live box runs, forwarding the prompt to an HTTP generate endpoint
+(`HERMES_LLM_URL`, bearer `HERMES_LLM_TOKEN`) so one machine holds the model
+credential for the fleet. Its `send` verb carries the status pings. Note that a
+shim behind that URL which hands the prompt to a CLI on argv has the same
+128 KiB cliff on its own side.
+
+The internal/sales writing guidance lives in
 [`templates/writing_spec.md`](templates/writing_spec.md) — edit it to match your
 team's voice. The client-facing template is `CLIENT_SPEC` in `run_recap.py`,
 kept separate on purpose so internal framing can't leak into a client email.

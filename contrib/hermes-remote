@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+"""Drop-in RECAP_GEN_BIN that talks to an HTTP generate endpoint.
+
+This is the wrapper the live box runs as RECAP_GEN_BIN. It keeps exactly one
+model-credential holder in the fleet (the box running an LLM shim); every other
+machine generates through this script instead of a local model install.
+
+Supported call shapes (the ones run_recap.py uses):
+  hermes-remote -m <model> -z <prompt>       -> generated text on stdout
+  hermes-remote -m <model> -z -              -> same, prompt read from STDIN
+  hermes-remote send -t <target> -q <msg>    -> status ping via ssh to the hub
+
+`-z -` exists because Linux caps a single argv element at 128 KiB. A two-hour
+transcript is about 100 KB before the writing spec and the Linear backlog are
+added, and `-z <prompt>` died on the live box with
+`OSError: [Errno 7] Argument list too long`. run_recap.py selects this form
+with RECAP_GEN_STDIN=1. The HTTP body has no such ceiling.
+
+Config (environment):
+  HERMES_LLM_URL    generate endpoint
+                    (default https://hermes-tmn.tailb5dd6c.ts.net/llm/generate)
+  HERMES_LLM_TOKEN  bearer token for the endpoint (required for -z)
+  HERMES_LLM_TIMEOUT  seconds to wait for a generation (default 600)
+  HERMES_HUB_SSH    user@host for the send verb
+                    (default screddy@hermes-tmn.tailb5dd6c.ts.net)
+"""
+import json
+import os
+import shlex
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+URL = os.environ.get("HERMES_LLM_URL",
+                     "https://hermes-tmn.tailb5dd6c.ts.net/llm/generate")
+HUB = os.environ.get("HERMES_HUB_SSH", "screddy@hermes-tmn.tailb5dd6c.ts.net")
+TIMEOUT = int(os.environ.get("HERMES_LLM_TIMEOUT", "600"))
+
+
+def _arg(flag):
+    argv = sys.argv[1:]
+    return argv[argv.index(flag) + 1] if flag in argv and argv.index(flag) + 1 < len(argv) else None
+
+
+def generate():
+    token = os.environ.get("HERMES_LLM_TOKEN")
+    if not token:
+        sys.exit("hermes-remote: HERMES_LLM_TOKEN is not set")
+    prompt = _arg("-z")
+    if prompt is None:
+        sys.exit("hermes-remote: missing -z <prompt>")
+    if prompt == "-":
+        prompt = sys.stdin.read()
+        if not prompt.strip():
+            sys.exit("hermes-remote: -z - given but stdin carried an empty prompt")
+    body = {"prompt": prompt, "system": ""}
+    model = _arg("-m")
+    if model:
+        body["model"] = model
+    req = urllib.request.Request(
+        URL, data=json.dumps(body).encode(),
+        headers={"Authorization": f"Bearer {token}",
+                 "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as response:
+            payload = json.loads(response.read().decode())
+    except urllib.error.HTTPError as exc:
+        sys.exit(f"hermes-remote: proxy HTTP {exc.code}: {exc.read().decode()[:300]}")
+    text = payload.get("text")
+    if not isinstance(text, str) or not text.strip():
+        sys.exit("hermes-remote: proxy returned no text")
+    sys.stdout.write(text)
+
+
+def send():
+    target, msg = _arg("-t"), _arg("-q")
+    if not (target and msg):
+        sys.exit("hermes-remote: send needs -t <target> -q <msg>")
+    # ssh joins remote argv with spaces, so quote to survive the remote shell
+    remote = " ".join(shlex.quote(a) for a in
+                      ["hermes", "send", "-t", target, "-q", msg])
+    proc = subprocess.run(
+        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+         "-o", "StrictHostKeyChecking=accept-new", HUB, remote],
+        capture_output=True, text=True, timeout=60,
+    )
+    if proc.returncode != 0:
+        sys.exit(f"hermes-remote: send failed: {proc.stderr.strip()[:300]}")
+
+
+def main():
+    if sys.argv[1:2] == ["send"]:
+        send()
+    else:
+        generate()
+
+
+if __name__ == "__main__":
+    main()

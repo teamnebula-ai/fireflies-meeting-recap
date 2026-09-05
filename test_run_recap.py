@@ -5,7 +5,7 @@ Run:  python3 -m unittest test_run_recap -v
 
 Covers the two things that must never regress:
   1. Recipient routing — the internal debrief NEVER reaches an external address;
-     the client recap goes to everyone.
+     the client draft is addressed to everyone but is not sent.
   2. Atomic claim() — duplicate Fireflies events for one meeting can't both
      proceed (the bug that sent 2 emails).
 
@@ -15,9 +15,11 @@ addresses here use @example.com; external use @acme.com.
 import os
 os.environ.setdefault("RECAP_INTERNAL_DOMAIN", "example.com")
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import run_recap
 
@@ -148,6 +150,57 @@ class TestRouting(unittest.TestCase):
         self.assertEqual(run_recap.route_sends("ambiguous", [], ["guest@acme.com"]), [])
 
 
+class TestDelivery(unittest.TestCase):
+    """Client-facing recaps stop in Gmail drafts; internal mail still sends."""
+
+    def test_client_recap_creates_one_addressed_draft_without_sending(self):
+        descriptor = {
+            "kind": "client",
+            "recipients": ["host@example.com", "guest@acme.com"],
+            "subject": "Recap",
+            "html": "<html><body><p>Thanks.</p></body></html>",
+        }
+        with patch.object(run_recap, "create_draft", return_value={"id": "draft-1"}) as draft, \
+             patch.object(run_recap, "send_email") as send:
+            result = run_recap.deliver_recap(descriptor)
+
+        self.assertEqual(result, {"id": "draft-1"})
+        draft.assert_called_once_with(
+            ["host@example.com", "guest@acme.com"], "Recap", descriptor["html"])
+        send.assert_not_called()
+
+    def test_internal_recap_still_sends(self):
+        descriptor = {
+            "kind": "internal",
+            "recipients": ["host@example.com"],
+            "subject": "Recap",
+            "html": "<html><body><p>Internal.</p></body></html>",
+        }
+        with patch.object(run_recap, "create_draft") as draft, \
+             patch.object(run_recap, "send_email", return_value={"id": "message-1"}) as send:
+            result = run_recap.deliver_recap(descriptor)
+
+        self.assertEqual(result, {"id": "message-1"})
+        send.assert_called_once_with(["host@example.com"], "Recap", descriptor["html"])
+        draft.assert_not_called()
+
+    def test_multi_recipient_draft_addresses_every_attendee(self):
+        with patch.object(run_recap, "_composio", return_value={"id": "draft-1"}) as composio:
+            run_recap.create_draft(
+                ["host@example.com", "guest@acme.com"],
+                "Recap",
+                "<html><body><p>Thanks.</p></body></html>",
+            )
+
+        composio.assert_called_once_with("GMAIL_CREATE_EMAIL_DRAFT", {
+            "recipient_email": "host@example.com",
+            "extra_recipients": ["guest@acme.com"],
+            "subject": "Recap",
+            "body": "<html><body><p>Thanks.</p></body></html>",
+            "is_html": True,
+        })
+
+
 class TestBlockedDomains(unittest.TestCase):
     """RECAP_BLOCKED_DOMAINS: no automated recap may be ADDRESSED to a blocked
     inbox, while classification still sees the true attendee list."""
@@ -173,7 +226,7 @@ class TestBlockedDomains(unittest.TestCase):
         for s in sends:
             self.assertNotIn("guest@lockeddown.com", s["recipients"],
                              f"{s['kind']} addressed a blocked inbox")
-        # genuine external guest still gets the client recap
+        # A genuine external guest remains addressed on the client draft.
         kinds = {s["kind"]: s["recipients"] for s in sends}
         self.assertIn("lee@acme.com", kinds["client"])
 
@@ -283,3 +336,210 @@ class TestAtomicClaim(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestComposioIdentity(unittest.TestCase):
+    """The send path must name the mailbox, and must not call a failed tool a success.
+
+    Live incident, 2026-08-21..09-03: the box carried a Composio key from an org
+    that had been retired, so every GMAIL_SEND_EMAIL and every fallback draft
+    answered 401 for two weeks. Nothing in the spawn log said so, and a Composio
+    reply of HTTP 200 with `successful: false` was being counted as a delivered
+    email. These pin the wire shape and the failure classification.
+    """
+
+    def setUp(self):
+        self._orig_req = run_recap._req
+        self._orig_env = {k: os.environ.get(k) for k in
+                          ("COMPOSIO_API_KEY", "COMPOSIO_USER_ID", "COMPOSIO_CONNECTED_ACCOUNT_ID")}
+        os.environ["COMPOSIO_API_KEY"] = "ak_test"
+        os.environ["COMPOSIO_USER_ID"] = "tmn-shawn"
+        os.environ.pop("COMPOSIO_CONNECTED_ACCOUNT_ID", None)
+        self.calls = []
+
+    def tearDown(self):
+        run_recap._req = self._orig_req
+        for k, v in self._orig_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def _fake_req(self, reply):
+        def fake(method, url, headers=None, body=None, timeout=60):
+            self.calls.append({"method": method, "url": url, "headers": headers, "body": body})
+            return reply
+        run_recap._req = fake
+
+    def test_connected_account_id_is_sent_when_configured(self):
+        os.environ["COMPOSIO_CONNECTED_ACCOUNT_ID"] = "ca_abc123"
+        self._fake_req({"successful": True, "data": {}})
+        run_recap.create_draft("me@example.com", "s", "<html></html>")
+        call = self.calls[0]
+        self.assertTrue(call["url"].endswith("/GMAIL_CREATE_EMAIL_DRAFT"))
+        self.assertEqual(call["headers"]["x-api-key"], "ak_test")
+        self.assertEqual(call["body"]["user_id"], "tmn-shawn")
+        self.assertEqual(call["body"]["connected_account_id"], "ca_abc123")
+
+    def test_connected_account_id_is_omitted_when_not_configured(self):
+        self._fake_req({"successful": True, "data": {}})
+        run_recap.send_email(["a@example.com", "b@example.com"], "s", "<html></html>")
+        body = self.calls[0]["body"]
+        self.assertNotIn("connected_account_id", body)
+        self.assertEqual(body["arguments"]["recipient_email"], "a@example.com")
+        self.assertEqual(body["arguments"]["extra_recipients"], ["b@example.com"])
+
+    def test_http_200_with_successful_false_is_a_failure(self):
+        self._fake_req({"successful": False, "error": "Precondition check failed", "data": None})
+        r = run_recap.send_email(["a@example.com"], "s", "<html></html>")
+        self.assertTrue(isinstance(r, dict) and r.get("_error"), r)
+        self.assertIn("Precondition check failed", r["_error"])
+
+    def test_http_error_stays_a_failure(self):
+        self._fake_req({"_error": "HTTP 401: Invalid API key"})
+        r = run_recap.create_draft("me@example.com", "s", "<html></html>")
+        self.assertIn("HTTP 401", r["_error"])
+
+    def test_missing_credentials_never_reach_the_wire(self):
+        os.environ.pop("COMPOSIO_USER_ID")
+        self._fake_req({"successful": True})
+        r = run_recap.send_email(["a@example.com"], "s", "<html></html>")
+        self.assertIn("missing", r["_error"])
+        self.assertEqual(self.calls, [])
+
+
+class TestFetchDiagnosis(unittest.TestCase):
+    """A transcript the key cannot see must say so in words that point at the cause.
+
+    Live incident, 2026-09-03: the Fireflies webhook started delivering IDs from
+    the teamnebula.ai workspace while the box's key belonged to a different
+    workspace. Every recap went "ambiguous" with a 200-character JSON dump as
+    the reason and nobody could tell a deleted transcript from a wrong key.
+    """
+
+    def setUp(self):
+        self._orig_req = run_recap._req
+        self._orig_key = os.environ.get("FIREFLIES_API_KEY")
+        os.environ["FIREFLIES_API_KEY"] = "ff_test"
+
+    def tearDown(self):
+        run_recap._req = self._orig_req
+        if self._orig_key is None:
+            os.environ.pop("FIREFLIES_API_KEY", None)
+        else:
+            os.environ["FIREFLIES_API_KEY"] = self._orig_key
+
+    def test_object_not_found_names_the_workspace_mismatch(self):
+        run_recap._req = lambda *a, **k: {
+            "errors": [{"friendly": True, "message": "Transcript not found", "code": "object_not_found",
+                        "extensions": {"code": "object_not_found"}}],
+            "data": {"transcript": None}}
+        t, err = run_recap.fetch_transcript("01ABC")
+        self.assertIsNone(t)
+        self.assertIn("Transcript not found", err)
+        self.assertIn("another Fireflies workspace", err)
+
+    def test_other_null_answers_keep_the_plain_reason(self):
+        run_recap._req = lambda *a, **k: {"data": {"transcript": None}}
+        t, err = run_recap.fetch_transcript("01ABC")
+        self.assertIsNone(t)
+        self.assertTrue(err.startswith("transcript null"))
+        self.assertNotIn("another Fireflies workspace", err)
+
+
+class TestGenerationTransport(unittest.TestCase):
+    """RECAP_GEN_STDIN=1 moves the prompt off argv.
+
+    Linux caps a single argv element at 128 KiB. A two-hour transcript is about
+    100 KB before the writing spec and the Linear backlog are added, and the live
+    box hit `OSError: [Errno 7] Argument list too long` on exactly that path.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.record = Path(self.tmp.name) / "calls.jsonl"
+        fake = Path(self.tmp.name) / "fake-gen"
+        fake.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            "args = sys.argv[1:]\n"
+            "data = sys.stdin.read() if '-' in args else ''\n"
+            f"open({str(self.record)!r}, 'a').write(json.dumps({{'argv': args, 'stdin_len': len(data)}}) + '\\n')\n"
+            "print('<html><body>' + ('<p>recap line</p>' * 40) + '</body></html>')\n"
+        )
+        fake.chmod(0o755)
+        self._saved = (run_recap.GEN_BIN, run_recap.GEN_MODEL, run_recap.GEN_STDIN, run_recap.GEN_TIMEOUT)
+        run_recap.GEN_BIN = str(fake)
+        run_recap.GEN_MODEL = "test/model"
+        run_recap.GEN_TIMEOUT = 30
+        self.transcript = {"title": "Big", "sentences": [{"speaker_name": "A", "text": "word " * 60}] * 300}
+
+    def tearDown(self):
+        run_recap.GEN_BIN, run_recap.GEN_MODEL, run_recap.GEN_STDIN, run_recap.GEN_TIMEOUT = self._saved
+        self.tmp.cleanup()
+
+    def _calls(self):
+        return [json.loads(l) for l in self.record.read_text().splitlines() if l.strip()]
+
+    def test_argv_mode_is_the_default_and_unchanged(self):
+        run_recap.GEN_STDIN = False
+        html = run_recap.generate_html("internal", self.transcript)
+        self.assertIn("<html", html)
+        call = self._calls()[0]
+        self.assertEqual(call["argv"][:3], ["-m", "test/model", "-z"])
+        self.assertTrue(call["argv"][3].startswith(run_recap.writing_spec()[:20]))
+        self.assertEqual(call["stdin_len"], 0)
+
+    def test_stdin_mode_sends_dash_and_the_whole_prompt_on_stdin(self):
+        run_recap.GEN_STDIN = True
+        html = run_recap.generate_html("internal", self.transcript)
+        self.assertIn("<html", html)
+        call = self._calls()[0]
+        self.assertEqual(call["argv"], ["-m", "test/model", "-z", "-"])
+        self.assertGreater(call["stdin_len"], 50_000)
+
+    def test_structured_generation_uses_the_same_transport(self):
+        run_recap.GEN_STDIN = True
+        fake = Path(run_recap.GEN_BIN)
+        fake.write_text(fake.read_text().replace("print('<html>", "print('{\"ok\": true}') or print('<html>"))
+        out = run_recap.generate_json("please answer with json " * 5000)
+        self.assertEqual(out, {"ok": True})
+        self.assertEqual(self._calls()[0]["argv"], ["-m", "test/model", "-z", "-"])
+        self.assertGreater(self._calls()[0]["stdin_len"], 100_000)
+
+    def test_load_env_reads_the_flag(self):
+        saved = os.environ.get("RECAP_GEN_STDIN")
+        try:
+            os.environ["RECAP_GEN_STDIN"] = "1"
+            run_recap.load_env()
+            self.assertTrue(run_recap.GEN_STDIN)
+            os.environ["RECAP_GEN_STDIN"] = "0"
+            run_recap.load_env()
+            self.assertFalse(run_recap.GEN_STDIN)
+        finally:
+            if saved is None:
+                os.environ.pop("RECAP_GEN_STDIN", None)
+            else:
+                os.environ["RECAP_GEN_STDIN"] = saved
+            run_recap.load_env()
+
+
+class TestLogTimestamps(unittest.TestCase):
+    """Every spawn-log line carries a UTC timestamp.
+
+    The live log had none, so a run that produced no output could not be placed
+    in time at all and the failure window had to be reconstructed from lock-file
+    mtimes.
+    """
+
+    def test_log_line_starts_with_utc_timestamp(self):
+        import io
+        buf = io.StringIO()
+        saved = run_recap.sys.stderr
+        run_recap.sys.stderr = buf
+        try:
+            run_recap.log("hello")
+        finally:
+            run_recap.sys.stderr = saved
+        line = buf.getvalue()
+        self.assertRegex(line, r"^\[recap \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\] hello\n$")

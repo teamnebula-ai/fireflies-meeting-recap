@@ -19,9 +19,10 @@ candidate IDs, transcript evidence, workspace relationships, and writes.
 
 Recipient policy:
   - Internal meeting (all attendees @RECAP_INTERNAL_DOMAIN) → one recap to all attendees.
-  - External/sales (>=1 outside attendee) → TWO emails:
+  - External/sales (>=1 outside attendee) → TWO artifacts:
       * internal debrief  → internal attendees ONLY (never the outside guest)
-      * client recap      → ALL participants, using a separate client-safe template
+      * client recap      → Gmail draft addressed to ALL participants, using a
+                            separate client-safe template; never auto-sent
   - If the recap owner did not personally join the meeting (based on Fireflies
     meeting_attendance), skip all recap sends/drafts.
   - Ambiguous (no emails, or outside guests but zero internal recipient, or fetch
@@ -62,6 +63,13 @@ WRITING_SPEC = Path(os.environ.get("RECAP_WRITING_SPEC", str(HERE / "templates" 
 GEN_BIN = os.environ.get("RECAP_GEN_BIN", "hermes")
 GEN_MODEL = os.environ.get("RECAP_GEN_MODEL", "gpt-5")
 GEN_TIMEOUT = int(os.environ.get("RECAP_GEN_TIMEOUT", "600"))
+# Prompt transport to GEN_BIN. Default: argv (`-z <prompt>`), which Linux caps
+# at 128 KiB per argument — a two-hour transcript is ~100 KB before the writing
+# spec and the Linear backlog are added, and the live box died on exactly that
+# with `OSError: [Errno 7] Argument list too long`. RECAP_GEN_STDIN=1 sends
+# `-z -` and the prompt on stdin instead; needs a GEN_BIN that reads `-` from
+# stdin (contrib/hermes-remote does).
+GEN_STDIN = os.environ.get("RECAP_GEN_STDIN", "0") == "1"
 
 # Identity / routing
 INTERNAL_DOMAIN = os.environ.get("RECAP_INTERNAL_DOMAIN", "example.com")
@@ -102,13 +110,18 @@ COMPOSIO_EXEC = "https://backend.composio.dev/api/v3/tools/execute"
 
 
 def log(msg):
-    sys.stderr.write(f"[recap] {msg}\n")
+    # UTC timestamp on every line. The spawn log is the only record of a run
+    # (the receiver detaches run_recap from journald), and a run that dies
+    # between the claim and the first generation line used to leave nothing that
+    # could be placed in time at all.
+    ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    sys.stderr.write(f"[recap {ts}] {msg}\n")
     sys.stderr.flush()
 
 
 def load_env():
     """Source RECAP_ENV_FILE into os.environ (KEY=VALUE, ignore #/blank)."""
-    global GEN_BIN, GEN_MODEL, GEN_TIMEOUT, INTERNAL_DOMAIN, OWNER_EMAIL
+    global GEN_BIN, GEN_MODEL, GEN_TIMEOUT, GEN_STDIN, INTERNAL_DOMAIN, OWNER_EMAIL
     global OWNER_DISPLAY_NAME, NOTIFY_TARGET, WRITING_SPEC, BLOCKED_DOMAINS, EMAIL_ALIASES
     if not ENV_FILE.exists():
         log(f"note: env file {ENV_FILE} not present (relying on process env)")
@@ -124,6 +137,7 @@ def load_env():
     GEN_BIN = os.environ.get("RECAP_GEN_BIN", GEN_BIN)
     GEN_MODEL = os.environ.get("RECAP_GEN_MODEL", GEN_MODEL)
     GEN_TIMEOUT = int(os.environ.get("RECAP_GEN_TIMEOUT", str(GEN_TIMEOUT)))
+    GEN_STDIN = os.environ.get("RECAP_GEN_STDIN", "1" if GEN_STDIN else "0") == "1"
     INTERNAL_DOMAIN = os.environ.get("RECAP_INTERNAL_DOMAIN", INTERNAL_DOMAIN)
     OWNER_EMAIL = os.environ.get("RECAP_OWNER_EMAIL", OWNER_EMAIL)
     OWNER_DISPLAY_NAME = os.environ.get("RECAP_OWNER_DISPLAY_NAME", OWNER_DISPLAY_NAME)
@@ -210,7 +224,23 @@ def fetch_transcript(meeting_id):
         return None, r["_error"]
     t = (r or {}).get("data", {}).get("transcript")
     if not t:
-        return None, f"transcript null (resp: {str(r)[:200]})"
+        # Fireflies answers `object_not_found` both for a deleted transcript and
+        # for one that exists in a workspace this key cannot see. The second is
+        # the one that bites: a webhook registered on another Fireflies account
+        # delivers IDs the key will never resolve, and every recap goes
+        # "ambiguous" with a JSON dump as the reason. Say which account holds
+        # the key so the mismatch is the first thing read, not the last.
+        errs = (r or {}).get("errors") if isinstance(r, dict) else None
+        codes = set()
+        for e in errs or []:
+            if isinstance(e, dict):
+                codes.add(str(e.get("code") or (e.get("extensions") or {}).get("code") or ""))
+        hint = ""
+        if "object_not_found" in codes:
+            hint = (" — the FIREFLIES_API_KEY account cannot see this transcript; the webhook "
+                    "that delivered it may belong to another Fireflies workspace (check the key "
+                    "with `{ user { email } }`)")
+        return None, f"transcript null (resp: {str(r)[:200]}){hint}"
     return t, None
 
 
@@ -295,16 +325,17 @@ def classify(transcript):
 
 
 def route_sends(mode, internal_recipients, all_emails):
-    """Pure recipient routing. Returns a list of {kind, recipients} send descriptors.
+    """Pure recipient routing. Returns a list of delivery descriptors.
 
     kind:
       'internal'      -> internal-meeting recap, to all (internal) attendees
       'sales_debrief' -> internal debrief (summary/next-steps), INTERNAL ONLY
-      'client'        -> client-facing recap, to ALL participants incl. the guest
+      'client'        -> client-facing draft, addressed to ALL participants
 
     Safety invariant (enforced here, asserted by tests): a 'sales_debrief' send
     NEVER contains an external address. The only thing that reaches outside
-    guests is the 'client' send, which carries the client-safe HTML.
+    guests is the 'client' draft, which carries the client-safe HTML and stays
+    in the owner's Gmail account until a person sends it.
 
     Blocked domains (RECAP_BLOCKED_DOMAINS) are stripped from every route.
     Classification upstream still sees the true attendee list — a call with a
@@ -321,7 +352,7 @@ def route_sends(mode, internal_recipients, all_emails):
         if debrief:
             sends.append({"kind": "sales_debrief", "recipients": debrief})
         client = sendable(all_emails)
-        # Only send a client recap if a genuine external recipient remains after
+        # Only draft a client recap if a genuine external recipient remains after
         # filtering — a call whose only guest was blocked has no client to recap to.
         if any(not e.endswith("@" + INTERNAL_DOMAIN) for e in client):
             sends.append({"kind": "client", "recipients": client})
@@ -424,6 +455,20 @@ def _clean_json(text):
     return payload
 
 
+def gen_argv(prompt):
+    """The GEN_BIN command line for a prompt: `-z <prompt>` or, with
+    RECAP_GEN_STDIN=1, `-z -` with the prompt delivered on stdin."""
+    if GEN_STDIN:
+        return [GEN_BIN, "-m", GEN_MODEL, "-z", "-"]
+    return [GEN_BIN, "-m", GEN_MODEL, "-z", prompt]
+
+
+def _gen_run(prompt, env):
+    """One GEN_BIN invocation. Raises subprocess.TimeoutExpired like subprocess.run."""
+    return subprocess.run(gen_argv(prompt), input=(prompt if GEN_STDIN else None),
+                          capture_output=True, text=True, timeout=GEN_TIMEOUT, env=env)
+
+
 def generate_json(prompt):
     """Run the configured model for structured analysis."""
     if not (os.path.exists(GEN_BIN) or _which(GEN_BIN)):
@@ -434,9 +479,7 @@ def generate_json(prompt):
     for attempt in (1, 2):
         log(f"gen structured attempt {attempt} model={GEN_MODEL}")
         try:
-            proc = subprocess.run([GEN_BIN, "-m", GEN_MODEL, "-z", prompt],
-                                  capture_output=True, text=True,
-                                  timeout=GEN_TIMEOUT, env=sub_env)
+            proc = _gen_run(prompt, sub_env)
         except subprocess.TimeoutExpired:
             last = f"timeout {GEN_TIMEOUT}s"
             continue
@@ -526,9 +569,7 @@ def generate_html(fmt, transcript):
         log(f"gen one-shot attempt {attempt} model={GEN_MODEL} fmt={fmt}")
         t0 = time.monotonic()
         try:
-            proc = subprocess.run([GEN_BIN, "-m", GEN_MODEL, "-z", prompt],
-                                  capture_output=True, text=True,
-                                  timeout=GEN_TIMEOUT, env=sub_env)
+            proc = _gen_run(prompt, sub_env)
         except subprocess.TimeoutExpired:
             last = f"timeout {GEN_TIMEOUT}s"
             continue
@@ -555,9 +596,27 @@ def _composio(tool, arguments):
     uid = os.environ.get("COMPOSIO_USER_ID")
     if not (key and uid):
         return {"_error": "COMPOSIO_API_KEY/USER_ID missing"}
-    return _req("POST", f"{COMPOSIO_EXEC}/{tool}",
-                {"x-api-key": key, "Content-Type": "application/json"},
-                {"user_id": uid, "arguments": arguments}, timeout=90)
+    body = {"user_id": uid, "arguments": arguments}
+    # Name the mailbox. A Composio entity can hold several Gmail connections and
+    # the default pick is silent; the REST execute route honours a top-level
+    # connected_account_id, so pass it whenever the deployment sets one.
+    ca = (os.environ.get("COMPOSIO_CONNECTED_ACCOUNT_ID") or "").strip()
+    if ca:
+        body["connected_account_id"] = ca
+    r = _req("POST", f"{COMPOSIO_EXEC}/{tool}",
+             {"x-api-key": key, "Content-Type": "application/json"}, body, timeout=90)
+    if isinstance(r, dict) and r.get("_error"):
+        # Loud in the spawn log. A dead key answered 401 on every send and every
+        # fallback draft for two weeks (2026-08-21..09-03) and the log never said so.
+        log(f"Composio {tool} failed: {str(r['_error'])[:300]}")
+        return r
+    if isinstance(r, dict) and r.get("successful") is False:
+        # HTTP 200 with a tool-level failure. Counting this as delivered is how a
+        # recap gets reported "✓ sent" with nothing in anyone's inbox.
+        err = f"Composio {tool} not successful: {str(r.get('error'))[:300]}"
+        log(err)
+        return {"_error": err, "raw": r}
+    return r
 
 
 def send_email(to_list, subject, html):
@@ -569,9 +628,20 @@ def send_email(to_list, subject, html):
 
 
 def create_draft(to, subject, html):
-    return _composio("GMAIL_CREATE_EMAIL_DRAFT",
-                     {"recipient_email": to, "subject": subject,
-                      "body": html, "is_html": True})
+    to_list = [to] if isinstance(to, str) else list(to)
+    if not to_list:
+        return {"_error": "draft requires at least one recipient"}
+    args = {"recipient_email": to_list[0], "subject": subject,
+            "body": html, "is_html": True}
+    if len(to_list) > 1:
+        args["extra_recipients"] = to_list[1:]
+    return _composio("GMAIL_CREATE_EMAIL_DRAFT", args)
+
+
+def deliver_recap(descriptor):
+    """Send internal mail; hold every client-facing recap as a Gmail draft."""
+    delivery = create_draft if descriptor["kind"] == "client" else send_email
+    return delivery(descriptor["recipients"], descriptor["subject"], descriptor["html"])
 
 
 def notify(msg):
@@ -751,7 +821,7 @@ def main():
             bad = client_safety_violation(s["html"])
             if bad and not args.dry:
                 sys.exit(f"ERROR: client recap failed deterministic content-safety "
-                         f"scan (matched {bad!r}) — nothing sent")
+                         f"scan (matched {bad!r}) — no draft created")
             if bad:
                 print(f"--- WARNING: client recap failed content-safety scan "
                       f"(matched {bad!r}) — a real run would abort")
@@ -759,14 +829,15 @@ def main():
     if args.dry:
         print(f"--- MODE={mode} FMT={fmt} REASON={reason}")
         for s in sends:
-            print(f"--- SEND kind={s['kind']} ({_KIND_LABEL[s['kind']]}) "
+            action = "DRAFT" if s["kind"] == "client" else "SEND"
+            print(f"--- {action} kind={s['kind']} ({_KIND_LABEL[s['kind']]}) "
                   f"RECIPIENTS={s['recipients']}")
             print(f"    SUBJECT: {s['subject']}")
             print(s["html"])
         print_linear_dry_run(reconcile_linear(transcript, dry=True))
         return
 
-    # ----- send each descriptor; fail-safe to an owner draft on any error ------
+    # ----- deliver internal mail; hold client-facing mail as drafts ------------
     results = []
     for s in sends:
         # Belt-and-suspenders: route_sends already strips blocked domains, but
@@ -775,21 +846,27 @@ def main():
         s["recipients"] = [e for e in s["recipients"] if not is_blocked_recipient(e)]
         if not s["recipients"]:
             continue
-        r = send_email(s["recipients"], s["subject"], s["html"])
+        r = deliver_recap(s)
         ok = not (isinstance(r, dict) and r.get("_error"))
         results.append((s, ok, r))
-        if not ok and OWNER_EMAIL:
+        if not ok and s["kind"] != "client" and OWNER_EMAIL:
             create_draft(OWNER_EMAIL, s["subject"], s["html"])
 
-    # Ticket reconciliation happens after email delivery and is best effort. A
-    # Linear outage or model failure can never suppress a recap email.
+    # Ticket reconciliation happens after email delivery or draft creation and
+    # is best effort. A Linear outage cannot suppress either artifact.
     linear_result = reconcile_linear(transcript)
     ledger_add(mid)  # claim already prevents re-fire; never re-run (would double-send the parts that worked)
     lines = []
     for s, ok, r in results:
         label = _KIND_LABEL[s["kind"]]
-        lines.append(f"✓ {label} → {', '.join(s['recipients'])}" if ok
-                     else f"✗ {label} FAILED (held a draft): {r}")
+        if ok and s["kind"] == "client":
+            lines.append(f"✓ {label} drafted → {', '.join(s['recipients'])}")
+        elif ok:
+            lines.append(f"✓ {label} sent → {', '.join(s['recipients'])}")
+        elif s["kind"] == "client":
+            lines.append(f"✗ {label} FAILED to draft: {r}")
+        else:
+            lines.append(f"✗ {label} FAILED (held an owner draft): {r}")
     lines.append(linear_recap.summarize(linear_result))
     notify(f"Recap for \"{title}\" ({mode}):\n" + "\n".join(lines))
 
