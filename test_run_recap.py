@@ -119,6 +119,23 @@ class TestSignature(unittest.TestCase):
         out = run_recap.enforce_owner_signature(html)
         self.assertIn("<p>Best,<br>Shawn</p>\n</body>", out)
 
+    def test_replaces_template_dash_sign_off_instead_of_stacking(self):
+        # writing_spec.md ends recaps with "– [Sender name]"; one signature only.
+        for dash in ("–", "—", "-"):
+            html = (f"<html><body><p>Check your action items.</p>"
+                    f"<p>{dash} Ibrahim</p></body></html>")
+            out = run_recap.enforce_owner_signature(html)
+            self.assertEqual(out.count("Best,"), 1, dash)
+            self.assertNotIn("Ibrahim", out)
+            self.assertIn("Check your action items.", out)
+
+    def test_dash_led_sentence_is_not_a_sign_off(self):
+        html = ("<html><body><p>Notes.</p>"
+                "<p>- Reply to this email with any corrections to the action items.</p>"
+                "</body></html>")
+        out = run_recap.enforce_owner_signature(html)
+        self.assertIn("any corrections to the action items.", out)
+
 
 class TestRouting(unittest.TestCase):
     def test_internal_one_send_to_all(self):
@@ -148,6 +165,76 @@ class TestRouting(unittest.TestCase):
 
     def test_ambiguous_routes_nothing(self):
         self.assertEqual(run_recap.route_sends("ambiguous", [], ["guest@acme.com"]), [])
+
+
+class TestClientDraftAddressing(unittest.TestCase):
+    """The owner sends the client draft, so it goes to the OTHER guests."""
+
+    def setUp(self):
+        self._owner, self._aliases = run_recap.OWNER_EMAIL, run_recap.EMAIL_ALIASES
+        run_recap.OWNER_EMAIL = "Host@Example.com"
+
+    def tearDown(self):
+        run_recap.OWNER_EMAIL, run_recap.EMAIL_ALIASES = self._owner, self._aliases
+
+    def test_owner_is_not_addressed_on_client_draft(self):
+        internal = ["host@example.com", "ops@example.com"]
+        allm = internal + ["guest@acme.com"]
+        sends = {s["kind"]: s["recipients"] for s in run_recap.route_sends("sales", internal, allm)}
+        self.assertEqual(sends["client"], ["ops@example.com", "guest@acme.com"])
+        # The internal debrief still reaches the owner.
+        self.assertIn("host@example.com", sends["sales_debrief"])
+
+    def test_owner_alias_is_folded_before_exclusion(self):
+        run_recap.EMAIL_ALIASES = {"host@agency.co": "host@example.com"}
+        emails = run_recap.attendee_emails(_t(["host@agency.co", "guest@acme.com"]))
+        mode, _, internal, _ = run_recap.classify(_t(["host@agency.co", "guest@acme.com"]))
+        sends = {s["kind"]: s["recipients"] for s in run_recap.route_sends(mode, internal, emails)}
+        self.assertEqual(sends["client"], ["guest@acme.com"])
+
+    def test_non_human_invite_addresses_are_ignored(self):
+        emails = run_recap.attendee_emails(
+            _t(["host@example.com", "no-reply@zoom.us", "Calendar-Notification@google.com"]))
+        self.assertEqual(emails, ["host@example.com"])
+        mode, *_ = run_recap.classify(_t(["host@example.com", "noreply@zoom.us"]))
+        self.assertEqual(mode, "internal")
+
+
+class TestClientRecapFormat(unittest.TestCase):
+    """Client drafts reuse the internal recap's template, subject, and standards."""
+
+    def _transcript(self):
+        t = _t(["host@example.com", "guest@acme.com"])
+        t["transcript_url"] = "https://app.fireflies.ai/view/SECRET-RECORDING"
+        t["summary"] = {"overview": "Kickoff."}
+        return t
+
+    def test_client_subject_matches_internal_recap_subject(self):
+        t = self._transcript()
+        self.assertEqual(run_recap.subject_for("client", t),
+                         run_recap.subject_for("internal", t))
+        self.assertEqual(run_recap.subject_for("client", t),
+                         "Demo Call Recap & Reminders – June 30, 2026 | Summary + Action Items")
+
+    def test_client_prompt_carries_the_internal_template(self):
+        prompt = run_recap.build_prompt("client", self._transcript())
+        spec = run_recap.writing_spec()
+        self.assertIn(spec, prompt)
+        for marker in ("Email HTML Structure — Internal Meetings", "🧭 Meeting Overview",
+                       "✅ Action Items by Owner", "border-top: 2px solid #1a73e8"):
+            self.assertIn(marker, prompt)
+        self.assertIn(run_recap.CLIENT_SPEC, prompt)
+
+    def test_client_prompt_never_sees_the_recording_link(self):
+        prompt = run_recap.build_prompt("client", self._transcript())
+        self.assertNotIn("SECRET-RECORDING", prompt)
+        self.assertNotIn("transcript_url", prompt)
+
+    def test_internal_prompts_keep_recording_link_and_no_client_overlay(self):
+        for fmt in ("internal", "sales"):
+            prompt = run_recap.build_prompt(fmt, self._transcript())
+            self.assertIn("SECRET-RECORDING", prompt)
+            self.assertNotIn(run_recap.CLIENT_SPEC, prompt)
 
 
 class TestDelivery(unittest.TestCase):

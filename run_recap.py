@@ -21,8 +21,10 @@ Recipient policy:
   - Internal meeting (all attendees @RECAP_INTERNAL_DOMAIN) → one recap to all attendees.
   - External/sales (>=1 outside attendee) → TWO artifacts:
       * internal debrief  → internal attendees ONLY (never the outside guest)
-      * client recap      → Gmail draft addressed to ALL participants, using a
-                            separate client-safe template; never auto-sent
+      * client recap      → Gmail draft addressed to every OTHER participant
+                            (the owner sends it), in the same layout and
+                            subject as the internal recap with client-safe
+                            content rules; never auto-sent
   - If the recap owner did not personally join the meeting (based on Fireflies
     meeting_attendance), skip all recap sends/drafts.
   - Ambiguous (no emails, or outside guests but zero internal recipient, or fetch
@@ -104,6 +106,12 @@ BLOCKED_DOMAINS = _parse_domains(os.environ.get("RECAP_BLOCKED_DOMAINS", ""))
 # but are internal. Alias SPECIFIC people, not whole domains — aliasing a domain
 # would classify a genuine guest at that domain as internal.
 EMAIL_ALIASES = _parse_aliases(os.environ.get("RECAP_EMAIL_ALIASES", ""))
+
+# Automated addresses that ride along on invites but are not people. Left in,
+# a Zoom notification address makes a solo webinar look like an external meeting
+# and would land on the client draft's To line.
+NON_HUMAN_PREFIXES = ("no-reply@", "noreply@", "donotreply@", "do-not-reply@",
+                      "calendar-notification@", "mailer-daemon@")
 
 FIREFLIES_GQL = "https://api.fireflies.ai/graphql"
 COMPOSIO_EXEC = "https://backend.composio.dev/api/v3/tools/execute"
@@ -251,7 +259,7 @@ def attendee_emails(transcript):
     emails = []
     for a in atts:
         e = canonical_email((a.get("email") or "").strip().lower())
-        if e and "@" in e and e not in emails:
+        if e and "@" in e and e not in emails and not e.startswith(NON_HUMAN_PREFIXES):
             emails.append(e)
     return emails
 
@@ -259,6 +267,12 @@ def attendee_emails(transcript):
 def canonical_email(email):
     """Map an aliased teammate address to their canonical internal identity."""
     return EMAIL_ALIASES.get(email, email)
+
+
+def is_owner(email):
+    """True for the recap owner's own address (after alias folding)."""
+    owner = canonical_email((OWNER_EMAIL or "").strip().lower())
+    return bool(owner) and email == owner
 
 
 def is_blocked_recipient(email):
@@ -330,12 +344,14 @@ def route_sends(mode, internal_recipients, all_emails):
     kind:
       'internal'      -> internal-meeting recap, to all (internal) attendees
       'sales_debrief' -> internal debrief (summary/next-steps), INTERNAL ONLY
-      'client'        -> client-facing draft, addressed to ALL participants
+      'client'        -> client-facing draft, addressed to every participant
+                         except the owner
 
     Safety invariant (enforced here, asserted by tests): a 'sales_debrief' send
     NEVER contains an external address. The only thing that reaches outside
     guests is the 'client' draft, which carries the client-safe HTML and stays
-    in the owner's Gmail account until a person sends it.
+    in the owner's Gmail account until a person sends it. The owner sends that
+    draft from their own mailbox, so they are its sender and never on its To line.
 
     Blocked domains (RECAP_BLOCKED_DOMAINS) are stripped from every route.
     Classification upstream still sees the true attendee list — a call with a
@@ -351,7 +367,7 @@ def route_sends(mode, internal_recipients, all_emails):
         debrief = sendable(internal_recipients)
         if debrief:
             sends.append({"kind": "sales_debrief", "recipients": debrief})
-        client = sendable(all_emails)
+        client = [e for e in sendable(all_emails) if not is_owner(e)]
         # Only draft a client recap if a genuine external recipient remains after
         # filtering — a call whose only guest was blocked has no client to recap to.
         if any(not e.endswith("@" + INTERNAL_DOMAIN) for e in client):
@@ -362,53 +378,41 @@ def route_sends(mode, internal_recipients, all_emails):
 
 # ----- generation (LLM layer only) --------------------------------------------
 def writing_spec():
-    """The internal/sales writing guidance (templates + standards)."""
+    """The writing guidance and HTML templates (internal, sales, and client)."""
     try:
         return WRITING_SPEC.read_text()
     except Exception as e:
         sys.exit(f"ERROR: cannot read writing spec {WRITING_SPEC}: {e}")
 
 
+# The client draft uses the INTERNAL recap's template from writing_spec.md, so
+# guests get the same layout, styling, and standards the team gets from one
+# source that cannot drift. This overlay changes only who the reader is: the
+# greeting, the recording line, and what content may appear.
 CLIENT_SPEC = """\
-You are writing a CLIENT-FACING meeting recap. This email is sent to EVERYONE who
-was on the call, INCLUDING the external guest/client. It is from the meeting host
-to the people they just met with.
+CLIENT-FACING RECAP. This email becomes a Gmail draft addressed to everyone else
+who was on the call, INCLUDING the external guests. The host reviews and sends it.
 
-ABSOLUTE RULES — the reader is the client. NEVER include any of the following:
+FORMAT: use the "Email HTML Structure — Internal Meetings" template above
+EXACTLY: the same inline styles, the same blue dividers, the 🧭 Meeting Overview
+section, one numbered section per major topic with its Decision line, and the
+✅ Action Items by Owner tables with priority tags. Apply every general standard
+above except the recording link. Never use the External / Sales debrief
+template. Change only these parts:
+- Greeting: "Hi [first names of the other attendees, comma-separated]," in place of "Team,".
+- Opening: 1-2 warm sentences thanking them for their time and stating the headline of the conversation.
+- Action Items by Owner: one heading per owner on either side, by first name, covering only commitments made on the call.
+- Leave out the Fireflies transcript/recording line entirely.
+- Closing line: invite them to reply with questions or corrections.
+
+CONTENT: the reader is the client. NEVER include any of the following:
 - Internal intel, "deal health", deal stage, or how the call "felt".
 - Budget speculation, pricing strategy, or guesses about their spend.
 - Competitive intel or mentions of other vendors they're evaluating.
 - Candid/internal assessments, "what didn't land", red flags, or buying signals.
 - Internal-only tasks (CRM updates, "build a demo for their use case", research).
 - The Fireflies transcript/recording link (that is internal only).
-Write warm, professional, concise. Use "we" for our side and "you" for the client.
-
-Use exactly this HTML structure:
-
-<html><body style="font-family: Arial, sans-serif; color: #333; line-height: 1.7; max-width: 800px;">
-<p>Hi [first names of the client attendees, comma-separated],</p>
-<p>[1-2 warm sentences thanking them for their time and stating the headline of the conversation.]</p>
-
-<h2 style="color: #1a73e8;">What we covered</h2>
-<ul>
-  <li>[Neutral, factual recap point — what was discussed, in client-appropriate language.]</li>
-  <li>[Another point...]</li>
-</ul>
-
-<h2 style="color: #1a73e8;">What we agreed</h2>
-<ul>
-  <li>[Any decisions or agreements reached together. Omit this section entirely if none.]</li>
-</ul>
-
-<h2 style="color: #1a73e8;">Next steps</h2>
-<table style="width: 100%; border-collapse: collapse; margin-bottom: 16px;">
-  <tr style="background: #f8f9fa;"><td style="padding: 8px; border: 1px solid #ddd; width: 120px;"><strong>Us</strong></td><td style="padding: 8px; border: 1px solid #ddd;">[What WE committed to do for them, with timing if stated.]</td></tr>
-  <tr><td style="padding: 8px; border: 1px solid #ddd;"><strong>You</strong></td><td style="padding: 8px; border: 1px solid #ddd;">[What THEY said they'd do, phrased as a friendly reminder. Omit row if none.]</td></tr>
-</table>
-
-<p>[Short, friendly closing inviting them to reply with questions.]</p>
-<p>Best,<br>Shawn</p>
-</body></html>
+Write warm, professional, and concise. Use "we" for our side and "you" for the client.
 """
 
 
@@ -517,14 +521,23 @@ def enforce_owner_signature(html):
     last = paragraphs[-1]
     last_text = re.sub(r"(?is)<br\s*/?>", "\n", last.group(0))
     last_text = re.sub(r"(?is)<[^>]+>", "", last_text).strip().lower()
-    if re.match(r"^(best|regards|thanks|thank you|sincerely|cheers)\b", last_text):
+    # Sign-offs: "Best, Name" and friends, or the recap template's "– Name"
+    # line. Left in place, a dash sign-off stacks on top of the owner signature.
+    if (re.match(r"^(best|regards|thanks|thank you|sincerely|cheers)\b", last_text)
+            or re.match(r"^[–—-]\s*[^\W\d_][\w .'-]{0,40}$", last_text)):
         return before_body[:last.start()] + signature + before_body[last.end():] + out[body_match.start():]
     return before_body + signature + "\n" + out[body_match.start():]
 
 
-def generate_html(fmt, transcript):
-    if not (os.path.exists(GEN_BIN) or _which(GEN_BIN)):
-        sys.exit(f"ERROR: generation CLI '{GEN_BIN}' not found (set RECAP_GEN_BIN)")
+_FMT_LABEL = {
+    "internal": "INTERNAL MEETING (standup/planning/retro) template",
+    "sales": "EXTERNAL / SALES CALL — internal debrief template",
+    "client": "INTERNAL MEETING template, written as the CLIENT-FACING recap described above,",
+}
+
+
+def build_prompt(fmt, transcript):
+    """The full generation prompt for one recap kind. Pure, so tests can check it."""
     payload = {
         "title": transcript.get("title"),
         "dateString": transcript.get("dateString"),
@@ -534,35 +547,35 @@ def generate_html(fmt, transcript):
         "summary": transcript.get("summary"),
         "sentences": transcript.get("sentences"),
     }
-    ctx = json.dumps(payload)[:90000]
+    client_brief = ""
     if fmt == "client":
-        prompt = (
-            f"{CLIENT_SPEC}\n\n"
-            f"========================================================\n"
-            f"Produce ONLY the email HTML body. Output raw HTML starting with "
-            f"<html> and ending with </html>. No preamble, no commentary, no "
-            f"code fences, no To/From/Subject lines. Never invent facts, owners, "
-            f"deadlines, or commitments.\n\n"
-            f"TRANSCRIPT (JSON):\n{ctx}"
-        )
-    else:
-        fmt_label = ("INTERNAL MEETING (standup/planning/retro)" if fmt == "internal"
-                     else "EXTERNAL / SALES CALL — internal debrief")
-        prompt = (
-            f"{writing_spec()}\n\n"
-            f"========================================================\n"
-            f"You are the WRITING layer only. The system has already fetched this "
-            f"transcript, decided the meeting type, and will handle ALL recipients "
-            f"and sending. Ignore any instruction above about tools, Gmail, "
-            f"recipients, drafts, or who to send to — that is NOT your job.\n\n"
-            f"Produce ONLY the email HTML body for this meeting using the "
-            f"{fmt_label} template and the quality standards above. Output raw HTML "
-            f"starting with <html> and ending with </html>. No preamble, no "
-            f"commentary, no code fences, no To/From/Subject lines. Never invent "
-            f"facts, owners, deadlines, or commitments — if an owner or deadline "
-            f"was not stated, write \"Not stated\".\n\n"
-            f"TRANSCRIPT (JSON):\n{ctx}"
-        )
+        # The recording link is internal. Keeping it out of the model's context
+        # means no client draft can carry it, whatever the model writes.
+        payload.pop("transcript_url")
+        client_brief = f"{CLIENT_SPEC}\n========================================================\n"
+    ctx = json.dumps(payload)[:90000]
+    return (
+        f"{writing_spec()}\n\n"
+        f"========================================================\n"
+        f"{client_brief}"
+        f"You are the WRITING layer only. The system has already fetched this "
+        f"transcript, decided the meeting type, and will handle ALL recipients "
+        f"and sending. Ignore any instruction above about tools, Gmail, "
+        f"recipients, drafts, or who to send to — that is NOT your job.\n\n"
+        f"Produce ONLY the email HTML body for this meeting using the "
+        f"{_FMT_LABEL[fmt]} and the quality standards above. Output raw HTML "
+        f"starting with <html> and ending with </html>. No preamble, no "
+        f"commentary, no code fences, no To/From/Subject lines. Never invent "
+        f"facts, owners, deadlines, or commitments — if an owner or deadline "
+        f"was not stated, write \"Not stated\".\n\n"
+        f"TRANSCRIPT (JSON):\n{ctx}"
+    )
+
+
+def generate_html(fmt, transcript):
+    if not (os.path.exists(GEN_BIN) or _which(GEN_BIN)):
+        sys.exit(f"ERROR: generation CLI '{GEN_BIN}' not found (set RECAP_GEN_BIN)")
+    prompt = build_prompt(fmt, transcript)
     sub_env = dict(os.environ)
     last = ""
     for attempt in (1, 2):
@@ -694,16 +707,12 @@ def fmt_date(transcript):
 
 
 def subject_for(fmt, transcript):
+    """Internal and client recaps share one subject; only the debrief differs."""
     title = (transcript.get("title") or "Meeting").strip()
     d = fmt_date(transcript)
     if fmt == "sales":
         return f"{title} Call Recap – {d} | Intel + Next Steps"
     return f"{title} Recap & Reminders – {d} | Summary + Action Items"
-
-
-def client_subject_for(transcript):
-    title = (transcript.get("title") or "Our meeting").strip()
-    return f"Recap & next steps: {title} – {fmt_date(transcript)}"
 
 
 _KIND_LABEL = {
@@ -799,7 +808,7 @@ def main():
     subj_for_kind = {
         "internal": subject_for("internal", transcript),
         "sales_debrief": subject_for("sales", transcript),
-        "client": client_subject_for(transcript),
+        "client": subject_for("client", transcript),
     }
     if not usable:
         held = (f"<html><body><p>Recap held for <b>{title}</b> (meeting {mid}). "
