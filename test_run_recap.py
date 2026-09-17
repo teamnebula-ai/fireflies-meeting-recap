@@ -373,6 +373,41 @@ class TestBlockedDomains(unittest.TestCase):
         self.assertFalse(run_recap.is_blocked_recipient("x@example.com"))
 
 
+class TestNoClientDraftDomains(unittest.TestCase):
+    """RECAP_NO_CLIENT_DRAFT_DOMAINS: any attendee there means no client draft for the meeting."""
+
+    def setUp(self):
+        self._orig = run_recap.NO_CLIENT_DRAFT_DOMAINS
+        run_recap.NO_CLIENT_DRAFT_DOMAINS = {"rs21.io", "osa.nm.gov"}
+
+    def tearDown(self):
+        run_recap.NO_CLIENT_DRAFT_DOMAINS = self._orig
+
+    def test_partner_on_the_call_suppresses_the_whole_client_draft(self):
+        internal = ["host@example.com"]
+        allm = ["host@example.com", "pm@rs21.io", "guest@slalom.com"]
+        kinds = {s["kind"]: s["recipients"] for s in run_recap.route_sends("sales", internal, allm)}
+        self.assertNotIn("client", kinds, "the other guests must not get an RS21 meeting's recap")
+        self.assertEqual(kinds["sales_debrief"], ["host@example.com"])
+
+    def test_listed_domain_and_its_subdomains_match(self):
+        self.assertEqual(run_recap.client_draft_exclusion(["a@osa.nm.gov"]), "osa.nm.gov")
+        self.assertEqual(run_recap.client_draft_exclusion(["a@eu.rs21.io"]), "eu.rs21.io")
+        self.assertIsNone(run_recap.client_draft_exclusion(["a@nm.gov", "b@notrs21.io"]))
+
+    def test_other_external_meetings_still_draft(self):
+        internal = ["host@example.com"]
+        allm = ["host@example.com", "kerry@washingtoncountyor.gov"]
+        kinds = {s["kind"] for s in run_recap.route_sends("sales", internal, allm)}
+        self.assertEqual(kinds, {"sales_debrief", "client"})
+
+    def test_load_env_reads_the_setting(self):
+        with patch.dict(os.environ, {"RECAP_NO_CLIENT_DRAFT_DOMAINS": "RS21.io, @osa.nm.gov"}), \
+             patch.object(run_recap, "ENV_FILE", Path("/nonexistent/recap.env")):
+            run_recap.load_env()
+            self.assertEqual(run_recap.NO_CLIENT_DRAFT_DOMAINS, {"rs21.io", "osa.nm.gov"})
+
+
 class TestEmailAliases(unittest.TestCase):
     """RECAP_EMAIL_ALIASES: teammates on a second address classify as internal."""
 

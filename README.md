@@ -173,6 +173,7 @@ All configuration is environment variables (see
 | `LINEAR_API_KEY` / `NEB_LINEAR_API_KEY` | Linear GraphQL access; NEB-prefixed value wins |
 | `RECAP_INTERNAL_DOMAIN` | the domain that counts as "internal" |
 | `RECAP_BLOCKED_DOMAINS` | domains that must never receive an automated recap (comma-separated) |
+| `RECAP_NO_CLIENT_DRAFT_DOMAINS` | domains whose presence on a call means no client draft for that meeting at all (comma-separated; subdomains match) |
 | `RECAP_EMAIL_ALIASES` | `alias=canonical` pairs for teammates on a second address |
 | `RECAP_OWNER_EMAIL` | mailbox that holds client drafts (left off their To line), plus fallback drafts and failures |
 | `RECAP_NOTIFY_TARGET` | optional status pings (blank to disable) |
@@ -211,7 +212,7 @@ still be placed in time.
 
 ### Recipient safety
 
-Four deterministic (non-LLM) gates run on every send:
+Five deterministic (non-LLM) gates run on every send:
 
 - **Blocked domains.** Addresses at a `RECAP_BLOCKED_DOMAINS` domain are
   stripped from every route, and re-filtered again at the send boundary as a
@@ -220,6 +221,13 @@ Four deterministic (non-LLM) gates run on every send:
   team — but no automated mail is ever addressed to a blocked inbox, and if the
   only guest was blocked, no client draft is created. Use this for clients
   under a no-automation agreement.
+- **No-client-draft domains.** If anyone on the call is at a
+  `RECAP_NO_CLIENT_DRAFT_DOMAINS` domain (or a subdomain of one), the meeting
+  gets its internal debrief and no client draft at all. Blocking would only
+  strip those addresses and still draft the recap to the other guests, which is
+  wrong for a partner who owns the client relationship. The live deployment
+  lists RS21 (`rs21.io`) and the RS21 project's state agencies (`osa.nm.gov`,
+  `doit.nm.gov`, `emnrd.nm.gov`).
 - **Email aliases.** `RECAP_EMAIL_ALIASES` canonicalizes teammates who join
   under a second address (an agency account, a personal calendar) to their
   internal identity, so those meetings classify as internal instead of leaking

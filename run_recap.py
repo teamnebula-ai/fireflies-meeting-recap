@@ -102,6 +102,13 @@ def _parse_aliases(raw):
 # guarantee holds even when such a person joins a call about something else.
 BLOCKED_DOMAINS = _parse_domains(os.environ.get("RECAP_BLOCKED_DOMAINS", ""))
 
+# Domains whose presence on a call means NO client draft for that meeting at all
+# (e.g. a partner whose client relationship we do not own, like RS21 and its
+# project clients). Stronger than BLOCKED_DOMAINS, which only strips those
+# addresses: stripping would still hand that meeting's recap to the other
+# guests. Subdomains match. The internal debrief is unaffected.
+NO_CLIENT_DRAFT_DOMAINS = _parse_domains(os.environ.get("RECAP_NO_CLIENT_DRAFT_DOMAINS", ""))
+
 # Teammates who join meetings under a second address (e.g. an agency account)
 # but are internal. Alias SPECIFIC people, not whole domains — aliasing a domain
 # would classify a genuine guest at that domain as internal.
@@ -131,6 +138,7 @@ def load_env():
     """Source RECAP_ENV_FILE into os.environ (KEY=VALUE, ignore #/blank)."""
     global GEN_BIN, GEN_MODEL, GEN_TIMEOUT, GEN_STDIN, INTERNAL_DOMAIN, OWNER_EMAIL
     global OWNER_DISPLAY_NAME, NOTIFY_TARGET, WRITING_SPEC, BLOCKED_DOMAINS, EMAIL_ALIASES
+    global NO_CLIENT_DRAFT_DOMAINS
     if not ENV_FILE.exists():
         log(f"note: env file {ENV_FILE} not present (relying on process env)")
     else:
@@ -152,6 +160,7 @@ def load_env():
     NOTIFY_TARGET = os.environ.get("RECAP_NOTIFY_TARGET", NOTIFY_TARGET)
     WRITING_SPEC = Path(os.environ.get("RECAP_WRITING_SPEC", str(WRITING_SPEC)))
     BLOCKED_DOMAINS = _parse_domains(os.environ.get("RECAP_BLOCKED_DOMAINS", ""))
+    NO_CLIENT_DRAFT_DOMAINS = _parse_domains(os.environ.get("RECAP_NO_CLIENT_DRAFT_DOMAINS", ""))
     EMAIL_ALIASES = _parse_aliases(os.environ.get("RECAP_EMAIL_ALIASES", ""))
 
 
@@ -275,6 +284,19 @@ def is_owner(email):
     return bool(owner) and email == owner
 
 
+def client_draft_exclusion(emails):
+    """The first attendee domain that rules out a client draft, or None.
+
+    Matches a listed domain exactly or as a parent domain (osa.nm.gov matches a
+    listed nm.gov entry too, so list the narrowest domain you mean)."""
+    for email in emails:
+        domain = (email.split("@", 1)[1] if "@" in email else "").lower()
+        for listed in NO_CLIENT_DRAFT_DOMAINS:
+            if domain == listed or domain.endswith("." + listed):
+                return domain
+    return None
+
+
 def is_blocked_recipient(email):
     domain = (email.split("@", 1)[1] if "@" in email else "").lower()
     return domain in BLOCKED_DOMAINS
@@ -369,8 +391,11 @@ def route_sends(mode, internal_recipients, all_emails):
             sends.append({"kind": "sales_debrief", "recipients": debrief})
         client = [e for e in sendable(all_emails) if not is_owner(e)]
         # Only draft a client recap if a genuine external recipient remains after
-        # filtering — a call whose only guest was blocked has no client to recap to.
-        if any(not e.endswith("@" + INTERNAL_DOMAIN) for e in client):
+        # filtering — a call whose only guest was blocked has no client to recap to —
+        # and no attendee belongs to a no-client-draft domain (checked against the
+        # TRUE attendee list, before any stripping).
+        if (any(not e.endswith("@" + INTERNAL_DOMAIN) for e in client)
+                and not client_draft_exclusion(all_emails)):
             sends.append({"kind": "client", "recipients": client})
         return sends
     return []  # ambiguous -> handled as a draft to the owner, not an auto-send
@@ -861,6 +886,9 @@ def main():
 
     if args.dry:
         print(f"--- MODE={mode} FMT={fmt} REASON={reason}")
+        excluded = client_draft_exclusion(all_emails) if mode == "sales" else None
+        if excluded:
+            print(f"--- no client draft: attendee at {excluded} (RECAP_NO_CLIENT_DRAFT_DOMAINS)")
         for s in sends:
             action = "DRAFT" if s["kind"] == "client" else "SEND"
             print(f"--- {action} kind={s['kind']} ({_KIND_LABEL[s['kind']]}) "
