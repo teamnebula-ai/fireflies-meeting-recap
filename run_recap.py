@@ -505,6 +505,29 @@ def _html_escape(value):
             .replace(">", "&gt;"))
 
 
+CLIENT_SPACER = "<p>&nbsp;</p>"
+
+
+def space_client_recap(html):
+    """Put one blank line after the client greeting and one before the signature.
+
+    Client recaps open with "Hi <names>," and close with the owner signature. A
+    paragraph margin alone renders as no gap in several mail clients, so the
+    blank line is an explicit spacer paragraph. Deterministic and idempotent:
+    it runs after enforce_owner_signature, so the signature it looks for is the
+    one that function wrote.
+    """
+    out = html or ""
+    greeting = re.search(r"(?is)<p[^>]*>\s*(hi|hello|hey)\b.*?</p>", out)
+    if greeting and not out[greeting.end():].lstrip().startswith(CLIENT_SPACER):
+        out = out[:greeting.end()] + "\n" + CLIENT_SPACER + out[greeting.end():]
+    signature = f"<p>Best,<br>{_html_escape(OWNER_DISPLAY_NAME)}</p>"
+    idx = out.rfind(signature)
+    if idx != -1 and not out[:idx].rstrip().endswith(CLIENT_SPACER):
+        out = out[:idx] + CLIENT_SPACER + "\n" + out[idx:]
+    return out
+
+
 def enforce_owner_signature(html):
     """Deterministically sign every recap from Shawn, never from another attendee."""
     out = _clean_html(html)
@@ -827,6 +850,7 @@ def main():
         s["subject"] = subj_for_kind[s["kind"]]
         s["html"] = enforce_owner_signature(generate_html(fmt_for_kind[s["kind"]], transcript))
         if s["kind"] == "client":
+            s["html"] = space_client_recap(s["html"])
             bad = client_safety_violation(s["html"])
             if bad and not args.dry:
                 sys.exit(f"ERROR: client recap failed deterministic content-safety "

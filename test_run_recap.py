@@ -137,6 +137,40 @@ class TestSignature(unittest.TestCase):
         self.assertIn("any corrections to the action items.", out)
 
 
+class TestClientSpacing(unittest.TestCase):
+    """Client drafts: one blank line after "Hi ...," and one before the signature."""
+
+    def setUp(self):
+        self._orig_display = run_recap.OWNER_DISPLAY_NAME
+        run_recap.OWNER_DISPLAY_NAME = "Shawn"
+
+    def tearDown(self):
+        run_recap.OWNER_DISPLAY_NAME = self._orig_display
+
+    HTML = ("<html><body style=\"font-family: Arial\">\n\n<p>Hi Kerry,</p>\n"
+            "<p>Thanks for your time.</p>\n<hr>\n<p>Reply with questions.</p>\n"
+            "<p>– Ibrahim</p>\n</body></html>")
+
+    def test_spacer_after_greeting_and_before_signature(self):
+        out = run_recap.space_client_recap(run_recap.enforce_owner_signature(self.HTML))
+        self.assertIn("<p>Hi Kerry,</p>\n<p>&nbsp;</p>\n<p>Thanks for your time.</p>", out)
+        self.assertIn("<p>Reply with questions.</p>\n<p>&nbsp;</p>\n<p>Best,<br>Shawn</p>", out)
+        self.assertEqual(out.count("<p>&nbsp;</p>"), 2)
+
+    def test_idempotent(self):
+        once = run_recap.space_client_recap(run_recap.enforce_owner_signature(self.HTML))
+        self.assertEqual(run_recap.space_client_recap(once), once)
+
+    def test_no_greeting_or_signature_changes_nothing_there(self):
+        html = "<html><body><p>Team,</p><p>Notes.</p></body></html>"
+        self.assertEqual(run_recap.space_client_recap(html), html)
+
+    def test_internal_recaps_are_not_spaced(self):
+        src = open(run_recap.__file__).read()
+        self.assertEqual(src.count("space_client_recap(s[\"html\"])"), 1)
+        self.assertIn('if s["kind"] == "client":\n            s["html"] = space_client_recap(s["html"])', src)
+
+
 class TestRouting(unittest.TestCase):
     def test_internal_one_send_to_all(self):
         allm = ["a@example.com", "b@example.com"]

@@ -248,7 +248,10 @@ for corrections, and internal intel stays out. The driver also removes
 `transcript_url` from the model's input for this draft, so the recording link
 has no way in. Every recap, internal or client, ends with one `Best, <RECAP_OWNER_DISPLAY_NAME>`
 signature; `enforce_owner_signature` replaces the template's `– Name` line
-instead of adding a second sign-off.
+instead of adding a second sign-off. Client drafts also get a blank line after
+the greeting and another before the signature (`space_client_recap`), written
+as a spacer paragraph because some mail clients render paragraph margins as no
+gap at all.
 
 A template edit in `writing_spec.md` changes both emails. Check a real meeting
 with `--dry` before deploying one.
