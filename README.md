@@ -12,8 +12,9 @@ decides who gets what:
 - **Internal meeting** (everyone is on your domain): one recap to all attendees.
 - **External / sales call** (an outside guest is present): the driver sends an
   **internal debrief** to your team and creates a **client-facing Gmail draft**
-  addressed to everyone on the call. A person reviews and sends the client
-  draft. Its separate template carries no internal notes.
+  in the owner's mailbox, addressed to everyone else on the call. The owner
+  reviews and sends it. The draft uses the internal recap's layout and subject
+  line, with client content rules and no recording link.
 - **Ambiguous** (no attendee emails, an outside-only call, or a fetch failure):
   a draft is held for the owner; nothing is sent automatically.
 
@@ -173,7 +174,7 @@ All configuration is environment variables (see
 | `RECAP_INTERNAL_DOMAIN` | the domain that counts as "internal" |
 | `RECAP_BLOCKED_DOMAINS` | domains that must never receive an automated recap (comma-separated) |
 | `RECAP_EMAIL_ALIASES` | `alias=canonical` pairs for teammates on a second address |
-| `RECAP_OWNER_EMAIL` | fallback inbox for drafts / failures |
+| `RECAP_OWNER_EMAIL` | mailbox that holds client drafts (left off their To line), plus fallback drafts and failures |
 | `RECAP_NOTIFY_TARGET` | optional status pings (blank to disable) |
 | `RECAP_GEN_BIN` / `RECAP_GEN_MODEL` | the generation CLI and model |
 | `RECAP_GEN_STDIN` | `1` sends the prompt to the CLI on stdin (`-z -`) instead of argv; see "Bring your own LLM" |
@@ -210,7 +211,7 @@ still be placed in time.
 
 ### Recipient safety
 
-Three deterministic (non-LLM) gates run on every send:
+Four deterministic (non-LLM) gates run on every send:
 
 - **Blocked domains.** Addresses at a `RECAP_BLOCKED_DOMAINS` domain are
   stripped from every route, and re-filtered again at the send boundary as a
@@ -228,6 +229,29 @@ Three deterministic (non-LLM) gates run on every send:
   phrase list (internal debrief, deal health, competitive intel, transcript
   links, ...) after generation; a real run aborts before anything is sent if the
   scan matches, and `--dry` prints a warning.
+- **Client draft addressing.** The owner (`RECAP_OWNER_EMAIL`, after alias
+  folding) sends the draft, so the driver leaves that address off its To line
+  and addresses every other attendee. Invite addresses such as `no-reply@` and
+  `calendar-notification@` count as nobody: they never make a meeting external
+  and never land on a draft.
+
+### Client draft format
+
+The client draft and the internal recap share one template: the Internal
+Meetings block in [`templates/writing_spec.md`](templates/writing_spec.md). A
+guest sees the same 🧭 Meeting Overview, numbered topic sections with their
+decisions, ✅ Action Items by Owner tables with priority tags, blue dividers,
+and the subject `<title> Recap & Reminders – <date> | Summary + Action Items`.
+`CLIENT_SPEC` in `run_recap.py` changes four things: the greeting names the
+guests (`Hi Dana, Lee,`), the Fireflies recording line goes away, the closing asks
+for corrections, and internal intel stays out. The driver also removes
+`transcript_url` from the model's input for this draft, so the recording link
+has no way in. Every recap, internal or client, ends with one `Best, <RECAP_OWNER_DISPLAY_NAME>`
+signature; `enforce_owner_signature` replaces the template's `– Name` line
+instead of adding a second sign-off.
+
+A template edit in `writing_spec.md` changes both emails. Check a real meeting
+with `--dry` before deploying one.
 
 ## Linear reconciliation
 
@@ -281,10 +305,10 @@ credential for the fleet. Its `send` verb carries the status pings. Note that a
 shim behind that URL which hands the prompt to a CLI on argv has the same
 128 KiB cliff on its own side.
 
-The internal/sales writing guidance lives in
-[`templates/writing_spec.md`](templates/writing_spec.md) — edit it to match your
-team's voice. The client-facing template is `CLIENT_SPEC` in `run_recap.py`,
-kept separate on purpose so internal framing can't leak into a client email.
+The writing guidance for every recap lives in
+[`templates/writing_spec.md`](templates/writing_spec.md). Edit it to match your
+team's voice. `CLIENT_SPEC` in `run_recap.py` holds only the client overrides
+described under [Client draft format](#client-draft-format).
 
 ## Test a meeting without sending
 

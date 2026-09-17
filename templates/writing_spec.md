@@ -1,10 +1,11 @@
 # Meeting recap — writing spec
 
-This file is the **writing guidance** fed to the generation step for INTERNAL
-recaps and EXTERNAL/SALES internal debriefs. It is intentionally generic — edit
-it to match your team's voice, sections, and priorities. (The client-facing
-template lives separately in `run_recap.py` as `CLIENT_SPEC` so internal framing
-can never leak into a client email.)
+This file is the **writing guidance** fed to the generation step for every
+recap: INTERNAL recaps, EXTERNAL/SALES internal debriefs, and the client-facing
+draft. It is intentionally generic — edit it to match your team's voice,
+sections, and priorities. The client draft uses the Internal Meetings template
+below, so a change there changes both. `CLIENT_SPEC` in `run_recap.py` only
+overrides the greeting, drops the recording line, and bars internal content.
 
 General standards for every recap:
 
