@@ -408,6 +408,46 @@ class TestNoClientDraftDomains(unittest.TestCase):
             self.assertEqual(run_recap.NO_CLIENT_DRAFT_DOMAINS, {"rs21.io", "osa.nm.gov"})
 
 
+class TestBlockedExternalContext(unittest.TestCase):
+    def setUp(self):
+        self._orig_domains = run_recap.BLOCKED_DOMAINS
+        self._orig_terms = run_recap.BLOCKED_EXTERNAL_TERMS
+        run_recap.BLOCKED_DOMAINS = {"rs21.io"}
+        run_recap.BLOCKED_EXTERNAL_TERMS = {
+            "rs21", "research innovations", "brady key", "nmosa", "unmccc"
+        }
+
+    def tearDown(self):
+        run_recap.BLOCKED_DOMAINS = self._orig_domains
+        run_recap.BLOCKED_EXTERNAL_TERMS = self._orig_terms
+
+    def test_blocked_domain_suppresses_only_client_route(self):
+        transcript = _t(["host@example.com", "brady@rs21.io", "guest@acme.com"])
+        sends = run_recap.apply_external_context_gate(
+            run_recap.route_sends(
+                "sales", ["host@example.com"], run_recap.attendee_emails(transcript)),
+            transcript,
+        )
+        self.assertEqual(
+            sends,
+            [{"kind": "sales_debrief", "recipients": ["host@example.com"]}],
+        )
+
+    def test_blocked_person_and_topic_match_with_boundaries(self):
+        transcript = _t(["host@example.com", "guest@acme.com"])
+        transcript["meeting_attendees"][1]["displayName"] = "Brady Key"
+        self.assertTrue(run_recap.meeting_has_blocked_external_context(transcript))
+        self.assertTrue(run_recap.meeting_has_blocked_external_context(
+            {"title": "NMOSA delivery review"}))
+        self.assertFalse(run_recap.meeting_has_blocked_external_context(
+            {"title": "Opening remarks for product review"}))
+
+    def test_unrelated_external_meeting_remains_sendable(self):
+        transcript = _t(["host@example.com", "guest@acme.com"])
+        transcript["title"] = "Prospect discovery"
+        self.assertFalse(run_recap.meeting_has_blocked_external_context(transcript))
+
+
 class TestEmailAliases(unittest.TestCase):
     """RECAP_EMAIL_ALIASES: teammates on a second address classify as internal."""
 

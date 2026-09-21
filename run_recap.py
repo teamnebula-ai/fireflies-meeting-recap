@@ -102,6 +102,17 @@ def _parse_aliases(raw):
 # guarantee holds even when such a person joins a call about something else.
 BLOCKED_DOMAINS = _parse_domains(os.environ.get("RECAP_BLOCKED_DOMAINS", ""))
 
+
+def _parse_terms(raw):
+    return {" ".join(t.strip().lower().split())
+            for t in (raw or "").split(",") if t.strip()}
+
+
+# People, project names, contract labels, and topics that suppress every
+# client-facing recap while leaving the internal debrief enabled.
+BLOCKED_EXTERNAL_TERMS = _parse_terms(
+    os.environ.get("RECAP_BLOCKED_EXTERNAL_TERMS", ""))
+
 # Domains whose presence on a call means NO client draft for that meeting at all
 # (e.g. a partner whose client relationship we do not own, like RS21 and its
 # project clients). Stronger than BLOCKED_DOMAINS, which only strips those
@@ -138,7 +149,7 @@ def load_env():
     """Source RECAP_ENV_FILE into os.environ (KEY=VALUE, ignore #/blank)."""
     global GEN_BIN, GEN_MODEL, GEN_TIMEOUT, GEN_STDIN, INTERNAL_DOMAIN, OWNER_EMAIL
     global OWNER_DISPLAY_NAME, NOTIFY_TARGET, WRITING_SPEC, BLOCKED_DOMAINS, EMAIL_ALIASES
-    global NO_CLIENT_DRAFT_DOMAINS
+    global NO_CLIENT_DRAFT_DOMAINS, BLOCKED_EXTERNAL_TERMS
     if not ENV_FILE.exists():
         log(f"note: env file {ENV_FILE} not present (relying on process env)")
     else:
@@ -161,6 +172,8 @@ def load_env():
     WRITING_SPEC = Path(os.environ.get("RECAP_WRITING_SPEC", str(WRITING_SPEC)))
     BLOCKED_DOMAINS = _parse_domains(os.environ.get("RECAP_BLOCKED_DOMAINS", ""))
     NO_CLIENT_DRAFT_DOMAINS = _parse_domains(os.environ.get("RECAP_NO_CLIENT_DRAFT_DOMAINS", ""))
+    BLOCKED_EXTERNAL_TERMS = _parse_terms(
+        os.environ.get("RECAP_BLOCKED_EXTERNAL_TERMS", ""))
     EMAIL_ALIASES = _parse_aliases(os.environ.get("RECAP_EMAIL_ALIASES", ""))
 
 
@@ -300,6 +313,25 @@ def client_draft_exclusion(emails):
 def is_blocked_recipient(email):
     domain = (email.split("@", 1)[1] if "@" in email else "").lower()
     return domain in BLOCKED_DOMAINS
+
+
+def meeting_has_blocked_external_context(transcript):
+    """True when a blocked domain, person, or topic appears in the meeting."""
+    text = " ".join(json.dumps(transcript or {}, ensure_ascii=False).lower().split())
+    for email_domain in re.findall(r"[a-z0-9._%+\-]+@([a-z0-9.\-]+)", text):
+        if email_domain.rstrip(".") in BLOCKED_DOMAINS:
+            return True
+    for term in BLOCKED_EXTERNAL_TERMS:
+        if re.search(rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])", text):
+            return True
+    return False
+
+
+def apply_external_context_gate(sends, transcript):
+    """Suppress only the client-facing route for sensitive meetings."""
+    if not meeting_has_blocked_external_context(transcript):
+        return sends
+    return [send for send in sends if send.get("kind") != "client"]
 
 
 def _norm_name(value):
@@ -842,7 +874,10 @@ def main():
 
     # ----- internal / sales: build the send plan -------------------------------
     all_emails = attendee_emails(transcript)
-    sends = route_sends(mode, recipients, all_emails)
+    sends = apply_external_context_gate(
+        route_sends(mode, recipients, all_emails), transcript)
+    if mode == "sales" and meeting_has_blocked_external_context(transcript):
+        log(f'client-facing recap blocked by meeting context for "{title}" ({mid})')
 
     # Safety invariant: the internal debrief must never reach an external address.
     external = [e for e in all_emails if not e.endswith("@" + INTERNAL_DOMAIN)]
