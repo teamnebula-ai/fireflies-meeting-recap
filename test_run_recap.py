@@ -171,6 +171,32 @@ class TestClientSpacing(unittest.TestCase):
         self.assertIn('if s["kind"] == "client":\n            s["html"] = space_client_recap(s["html"])', src)
 
 
+class TestHtmlQuality(unittest.TestCase):
+    def test_clean_html_strips_model_chatter_and_closes_containers(self):
+        out = run_recap._clean_html("Preamble <html><body><p>Hi.</p></body></html> trailing")
+        self.assertEqual(out, "<html><body><p>Hi.</p></body></html>")
+
+    def test_validator_rejects_placeholders_and_unsafe_markup(self):
+        self.assertIn("placeholder", run_recap.html_format_violation(
+            "<html><body><p>Hi [client name]</p><p>Best,<br>Shawn</p></body></html>"))
+        self.assertIn("unsupported <script>", run_recap.html_format_violation(
+            "<html><body><script>alert(1)</script><p>Best,<br>Shawn</p></body></html>"))
+
+    def test_voice_gate_requires_a_meeting_detail(self):
+        html = "<html><body><p>We will follow up soon.</p><p>Best,<br>Shawn</p></body></html>"
+        self.assertEqual(
+            run_recap.recap_voice_violation(
+                html, {"title": "ERP warehouse review", "summary": "Maya owns access"}),
+            "no concrete meeting detail",
+        )
+
+    def test_signature_replaces_prior_signer(self):
+        html = "<html><body><p>Notes.</p><p>Best,<br>Ibrahim</p></body></html>"
+        out = run_recap.enforce_owner_signature(html)
+        self.assertNotIn("Ibrahim", out)
+        self.assertEqual(out.count("Best,<br>Shawn"), 1)
+
+
 class TestRouting(unittest.TestCase):
     def test_internal_one_send_to_all(self):
         allm = ["a@example.com", "b@example.com"]
