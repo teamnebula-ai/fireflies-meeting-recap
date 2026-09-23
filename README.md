@@ -174,6 +174,7 @@ All configuration is environment variables (see
 | `RECAP_INTERNAL_DOMAIN` | the domain that counts as "internal" |
 | `RECAP_BLOCKED_DOMAINS` | domains that must never receive an automated recap (comma-separated) |
 | `RECAP_NO_CLIENT_DRAFT_DOMAINS` | domains whose presence on a call means no client draft for that meeting at all (comma-separated; subdomains match) |
+| `RECAP_BLOCKED_EXTERNAL_TERMS` | people, projects, and topics that suppress every client-facing recap |
 | `RECAP_EMAIL_ALIASES` | `alias=canonical` pairs for teammates on a second address |
 | `RECAP_OWNER_EMAIL` | mailbox that holds client drafts (left off their To line), plus fallback drafts and failures |
 | `RECAP_NOTIFY_TARGET` | optional status pings (blank to disable) |
@@ -228,6 +229,10 @@ Five deterministic (non-LLM) gates run on every send:
   wrong for a partner who owns the client relationship. The live deployment
   lists RS21 (`rs21.io`) and the RS21 project's state agencies (`osa.nm.gov`,
   `doit.nm.gov`, `emnrd.nm.gov`).
+- **Blocked meeting context.** If a blocked domain appears anywhere in the
+  meeting, or `RECAP_BLOCKED_EXTERNAL_TERMS` matches a person, project, contract,
+  or topic in the title, attendees, summary, or transcript, the system suppresses
+  every client-facing recap. The internal debrief still goes to your team.
 - **Email aliases.** `RECAP_EMAIL_ALIASES` canonicalizes teammates who join
   under a second address (an agency account, a personal calendar) to their
   internal identity, so those meetings classify as internal instead of leaking
